@@ -1,0 +1,4 @@
+ip,hostname,description
+10.1.1.50,server-prod-01,Production web server
+10.1.1.51,server-prod-02,Production app server
+10.1.1.52,db-primary-01,Primary database
