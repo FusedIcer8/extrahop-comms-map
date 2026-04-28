@@ -218,6 +218,67 @@ function Get-EHDeviceByIp {
     return @{ Success = $true; Data = $match; StatusCode = 200 }
 }
 
+function Get-EHDeviceByHostname {
+    <#
+    .SYNOPSIS
+        Resolves an ExtraHop device ID from a hostname/DNS name.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Hostname)
+
+    $encoded = [System.Uri]::EscapeDataString($Hostname)
+    $endpoint = "/api/v1/devices?search_type=name&value=$encoded&active_from=-$($script:LookbackMs)&active_until=0&limit=50"
+
+    $result = Invoke-EHRequest -Endpoint $endpoint
+    if (-not $result.Success) { return $result }
+
+    $devices = $result.Data
+    if (-not $devices -or $devices.Count -eq 0) {
+        return @{ Success = $false; StatusCode = 404; Error = "No device found for hostname $Hostname" }
+    }
+
+    # Prefer exact match on display_name or dns_name
+    $match = $devices | Where-Object {
+        $_.display_name -eq $Hostname -or $_.dns_name -eq $Hostname -or
+        $_.display_name -ieq $Hostname -or $_.dns_name -ieq $Hostname
+    } | Sort-Object -Property mod_time -Descending | Select-Object -First 1
+
+    if (-not $match) {
+        $match = $devices | Sort-Object -Property mod_time -Descending | Select-Object -First 1
+    }
+
+    return @{ Success = $true; Data = $match; StatusCode = 200 }
+}
+
+function Resolve-EHDevice {
+    <#
+    .SYNOPSIS
+        Resolves an ExtraHop device by IP first, then falls back to hostname.
+        Returns the resolved device or a failure result.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()][string]$IpAddress,
+        [Parameter()][string]$Hostname
+    )
+
+    # Try IP first if available
+    if ($IpAddress) {
+        $result = Get-EHDeviceByIp -IpAddress $IpAddress
+        if ($result.Success) { return $result }
+    }
+
+    # Fall back to hostname lookup
+    if ($Hostname) {
+        $result = Get-EHDeviceByHostname -Hostname $Hostname
+        if ($result.Success) { return $result }
+    }
+
+    # Both failed
+    $identifier = if ($IpAddress) { $IpAddress } else { $Hostname }
+    return @{ Success = $false; StatusCode = 404; Error = "No device found for $identifier" }
+}
+
 function Get-EHDevicePeers {
     <#
     .SYNOPSIS
@@ -293,16 +354,17 @@ function Invoke-EHDataCollection {
         $description = if ($device.description) { $device.description } else { "" }
         $prefix = "[$($i + 1)/$total]"
 
-        # Resolve device in ExtraHop
-        $resolved = Get-EHDeviceByIp -IpAddress $ip
+        # Resolve device in ExtraHop (try IP first, fall back to hostname)
+        $resolved = Resolve-EHDevice -IpAddress $ip -Hostname $hostname
+        $displayIdentifier = if ($ip) { "$ip ($hostname)" } else { $hostname }
         if (-not $resolved.Success) {
             if ($resolved.StatusCode -eq 404) {
-                Write-Host "$prefix $ip ($hostname)... " -NoNewline
+                Write-Host "$prefix $displayIdentifier... " -NoNewline
                 Write-Host "NOT FOUND in ExtraHop" -ForegroundColor Yellow
-                [void]$warnings.Add(@{ Ip = $ip; Hostname = $hostname; Reason = "Device not found in ExtraHop" })
+                [void]$warnings.Add(@{ Ip = $ip; Hostname = $hostname; Reason = "Device not found in ExtraHop (tried IP and hostname)" })
             }
             else {
-                Write-Host "$prefix $ip ($hostname)... " -NoNewline
+                Write-Host "$prefix $displayIdentifier... " -NoNewline
                 Write-Host "API error ($($resolved.StatusCode)) skipping" -ForegroundColor Red
                 [void]$warnings.Add(@{ Ip = $ip; Hostname = $hostname; Reason = "API error: $($resolved.Error)" })
             }
@@ -365,8 +427,11 @@ function Invoke-EHDataCollection {
             }
         }
 
+        # If resolved by hostname and we didn't have an IP, populate from ExtraHop
+        if (-not $ip -and $ehDevice.ipaddr4) { $ip = $ehDevice.ipaddr4 }
+
         $peerCount = ($peers | Measure-Object).Count
-        Write-Host "$prefix $ip ($hostname)... " -NoNewline
+        Write-Host "$prefix $displayIdentifier... " -NoNewline
         Write-Host "found (id=$deviceId) -> $peerCount peers" -ForegroundColor Green
 
         if ($peerCount -eq 0) {
@@ -930,60 +995,60 @@ $seenIps = @{}
 foreach ($row in $rawCsv) {
     # Get IP from various column name formats
     $ip = $null
-    foreach ($prop in $row.PSObject.Properties) {
-        if ($prop.Name.Trim().ToLower() -eq "ip") {
-            $ip = $prop.Value.Trim()
-            break
-        }
-    }
-
-    if (-not $ip) {
-        Write-Host "SKIP: Row with no valid IP column" -ForegroundColor Yellow
-        continue
-    }
-
-    # Skip CIDR notation
-    if ($ip -match "/\d+$") {
-        Write-Host "SKIP: CIDR notation not supported: $ip" -ForegroundColor Yellow
-        continue
-    }
-
-    # Skip invalid IPs
-    if ($ip -notmatch "^[\d.:a-fA-F]+$") {
-        Write-Host "SKIP: Invalid IP format: $ip" -ForegroundColor Yellow
-        continue
-    }
-
-    # Deduplicate
-    if ($seenIps.ContainsKey($ip)) {
-        Write-Host "SKIP: Duplicate IP: $ip" -ForegroundColor Yellow
-        continue
-    }
-    $seenIps[$ip] = $true
-
-    # Get hostname and description
     $hostname = ""; $description = ""
     foreach ($prop in $row.PSObject.Properties) {
         $key = $prop.Name.Trim().ToLower()
-        if ($key -eq "hostname") { $hostname = $prop.Value.Trim() }
-        if ($key -eq "description") { $description = $prop.Value.Trim() }
+        if ($key -eq "ip") { $ip = if ($prop.Value) { $prop.Value.Trim() } else { "" } }
+        if ($key -eq "hostname") { $hostname = if ($prop.Value) { $prop.Value.Trim() } else { "" } }
+        if ($key -eq "description") { $description = if ($prop.Value) { $prop.Value.Trim() } else { "" } }
     }
+
+    # Must have at least IP or hostname
+    if (-not $ip -and -not $hostname) {
+        Write-Host "SKIP: Row with no IP and no hostname" -ForegroundColor Yellow
+        continue
+    }
+
+    # Validate IP if present
+    if ($ip) {
+        # Skip CIDR notation
+        if ($ip -match "/\d+$") {
+            Write-Host "SKIP: CIDR notation not supported: $ip" -ForegroundColor Yellow
+            continue
+        }
+
+        # Skip invalid IPs
+        if ($ip -notmatch "^[\d.:a-fA-F]+$") {
+            Write-Host "SKIP: Invalid IP format: $ip" -ForegroundColor Yellow
+            continue
+        }
+    }
+
+    # Deduplicate by IP (if present) or hostname
+    $dedupeKey = if ($ip) { $ip } else { $hostname.ToLower() }
+    if ($seenIps.ContainsKey($dedupeKey)) {
+        Write-Host "SKIP: Duplicate entry: $dedupeKey" -ForegroundColor Yellow
+        continue
+    }
+    $seenIps[$dedupeKey] = $true
 
     [void]$devices.Add(@{ ip = $ip; hostname = $hostname; description = $description })
 }
 
 if ($devices.Count -eq 0) {
-    Write-Error "No valid devices found in input CSV. Ensure 'ip' column exists with valid IP addresses."
+    Write-Error "No valid devices found in input CSV. Ensure 'ip' and/or 'hostname' columns exist."
     exit 1
 }
 
-# Check required columns
-$hasIpColumn = $false
+# Check required columns — need at least one of ip or hostname
+$hasIpColumn = $false; $hasHostnameColumn = $false
 foreach ($prop in $rawCsv[0].PSObject.Properties) {
-    if ($prop.Name.Trim().ToLower() -eq "ip") { $hasIpColumn = $true; break }
+    $key = $prop.Name.Trim().ToLower()
+    if ($key -eq "ip") { $hasIpColumn = $true }
+    if ($key -eq "hostname") { $hasHostnameColumn = $true }
 }
-if (-not $hasIpColumn) {
-    Write-Error "Input CSV missing required 'ip' column."
+if (-not $hasIpColumn -and -not $hasHostnameColumn) {
+    Write-Error "Input CSV missing required columns. Must have at least 'ip' or 'hostname' column."
     exit 1
 }
 

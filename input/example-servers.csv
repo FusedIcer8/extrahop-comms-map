@@ -14,3 +14,6 @@ ip,hostname,description
 10.1.3.100,citrix-sf-01,Citrix StoreFront
 10.1.3.101,citrix-ddc-01,Citrix Delivery Controller
 10.1.4.50,exchange-01,Exchange mailbox server
+,sccm-primary,SCCM primary site server (hostname-only lookup)
+,sharepoint-app-01,SharePoint app server (hostname-only lookup)
+,monitoring-01,Monitoring server (hostname-only lookup)

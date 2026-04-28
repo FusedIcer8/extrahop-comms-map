@@ -36,7 +36,7 @@ All config can also be passed as script parameters (overrides env vars):
 
 ## Input CSV
 
-Create `.\input\servers.csv` with at minimum an `ip` column:
+Create `.\input\servers.csv` with at minimum an `ip` or `hostname` column (or both):
 
 ```csv
 ip,hostname,description
@@ -44,11 +44,14 @@ ip,hostname,description
 10.1.1.51,server-prod-02,Production app server
 10.1.1.52,db-primary-01,Primary database
 192.168.1.100,workstation-01,Developer machine
+,sccm-primary,SCCM server (hostname-only lookup)
 ```
 
-- `ip` — Required. IPv4 or IPv6 address.
-- `hostname` — Optional. Display label.
+- `ip` — IPv4 or IPv6 address. If provided, used as primary lookup.
+- `hostname` — Device hostname/DNS name. Used as fallback if IP lookup fails, or as primary lookup if no IP is provided.
 - `description` — Optional. Friendly description for the report.
+
+**Lookup logic**: The script tries IP-based resolution first. If that fails (or no IP is provided), it falls back to hostname-based resolution using ExtraHop's name search. This means you can query devices even when you only know the hostname.
 
 Column names are case-insensitive and trimmed of whitespace.
 
