@@ -1,6 +1,8 @@
 <#
 .SYNOPSIS
     Dry-run validation of Invoke-ExtraHopCommsMap.ps1 with mocked API functions.
+    Mocks Invoke-RestMethod to simulate ExtraHop API responses using the correct
+    API endpoints: POST /activitymaps/query, GET /devices/{id}/activity, POST /metrics.
 #>
 
 Set-StrictMode -Version Latest
@@ -32,238 +34,138 @@ else {
 
 Write-Host "`n=== VALIDATION STEP 2: Dry-Run with Mocked APIs ===" -ForegroundColor Cyan
 
-# Set up env vars for mock run
+# Write a temp runner script that overrides Invoke-RestMethod globally
+$runnerPath = Join-Path $scriptDir "_test_runner.ps1"
+
+$testContent = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$scriptDir = $PSScriptRoot
+
+# Override Invoke-RestMethod to return mock data matching actual ExtraHop API
+function Global:Invoke-RestMethod {
+    param(
+        [string]$Uri,
+        [string]$Method = "GET",
+        [hashtable]$Headers,
+        [string]$ContentType,
+        [string]$Body,
+        [switch]$SkipCertificateCheck,
+        [string]$ErrorAction
+    )
+
+    # GET /api/v1/devices?search_type=ip%20address&value=<ip>
+    if ($Uri -match "/api/v1/devices\?search_type=ip" -and $Method -eq "GET") {
+        $ip = if ($Uri -match "value=([^&]+)") { [System.Uri]::UnescapeDataString($Matches[1]) } else { "" }
+        # Simulate not-found for third device
+        if ($ip -eq "10.1.1.52") {
+            $ex = New-Object System.Net.WebException "The remote server returned an error: (404) Not Found."
+            $resp = [PSCustomObject]@{ StatusCode = [System.Net.HttpStatusCode]::NotFound }
+            $ex | Add-Member -NotePropertyName Response -NotePropertyValue $resp -Force
+            throw $ex
+        }
+        $deviceId = if ($ip -eq "10.1.1.50") { 1001 } else { 1002 }
+        return @([PSCustomObject]@{
+            id            = $deviceId
+            ipaddr4       = $ip
+            ipaddr6       = ""
+            display_name  = "mock-device-$deviceId"
+            device_class  = "node"
+            dns_name      = "mock-$deviceId.local"
+            mod_time      = (Get-Date).Ticks
+            extrahop_id   = "eh-$deviceId"
+            last_seen_time = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        })
+    }
+
+    # GET /api/v1/devices?search_type=name&value=<hostname>
+    if ($Uri -match "/api/v1/devices\?search_type=name" -and $Method -eq "GET") {
+        $hostname = if ($Uri -match "value=([^&]+)") { [System.Uri]::UnescapeDataString($Matches[1]) } else { "" }
+        return @([PSCustomObject]@{
+            id            = 1003
+            ipaddr4       = "10.1.1.99"
+            ipaddr6       = ""
+            display_name  = $hostname
+            device_class  = "node"
+            dns_name      = "$hostname.local"
+            mod_time      = (Get-Date).Ticks
+            extrahop_id   = "eh-1003"
+            last_seen_time = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        })
+    }
+
+    # GET /api/v1/devices/{id} — individual device lookup
+    if ($Uri -match "/api/v1/devices/(\d+)$" -and $Method -eq "GET") {
+        $did = [int]$Matches[1]
+        $peerIps = @{ 2001 = "192.168.1.10"; 2002 = "192.168.1.20"; 2003 = "10.0.0.1" }
+        $peerNames = @{ 2001 = "peer-web-01"; 2002 = "peer-db-01"; 2003 = "gateway" }
+        $peerTypes = @{ 2001 = "node"; 2002 = "node"; 2003 = "gateway" }
+        return [PSCustomObject]@{
+            id           = $did
+            ipaddr4      = if ($peerIps.ContainsKey($did)) { $peerIps[$did] } else { "10.0.0.$did" }
+            ipaddr6      = ""
+            display_name = if ($peerNames.ContainsKey($did)) { $peerNames[$did] } else { "device-$did" }
+            device_class = if ($peerTypes.ContainsKey($did)) { $peerTypes[$did] } else { "node" }
+            dns_name     = if ($peerNames.ContainsKey($did)) { "$($peerNames[$did]).local" } else { "device-$did.local" }
+            mod_time     = (Get-Date).Ticks
+        }
+    }
+
+    # GET /api/v1/devices/{id}/activity
+    if ($Uri -match "/api/v1/devices/\d+/activity" -and $Method -eq "GET") {
+        return @(
+            [PSCustomObject]@{ id = 1; device_id = 1001; stat_name = "extrahop.device.http_client"; from_time = 1700000000000; until_time = 1700100000000; mod_time = 1700100000000 },
+            [PSCustomObject]@{ id = 2; device_id = 1001; stat_name = "extrahop.device.ssl_client"; from_time = 1700000000000; until_time = 1700100000000; mod_time = 1700100000000 },
+            [PSCustomObject]@{ id = 3; device_id = 1001; stat_name = "extrahop.device.dns_client"; from_time = 1700000000000; until_time = 1700100000000; mod_time = 1700100000000 },
+            [PSCustomObject]@{ id = 4; device_id = 1001; stat_name = "extrahop.device.tcp"; from_time = 1700000000000; until_time = 1700100000000; mod_time = 1700100000000 },
+            [PSCustomObject]@{ id = 5; device_id = 1001; stat_name = "extrahop.device.ssh_client"; from_time = 1700000000000; until_time = 1700100000000; mod_time = 1700100000000 }
+        )
+    }
+
+    # POST /api/v1/activitymaps/query — topology query
+    if ($Uri -match "/api/v1/activitymaps/query" -and $Method -eq "POST") {
+        # Return mock topology with nodes and edges
+        return [PSCustomObject]@{
+            nodes = @(
+                [PSCustomObject]@{ id = 2001; ipaddr4 = "192.168.1.10"; ipaddr6 = ""; display_name = "peer-web-01"; device_class = "node"; dns_name = "peer-web-01.local" },
+                [PSCustomObject]@{ id = 2002; ipaddr4 = "192.168.1.20"; ipaddr6 = ""; display_name = "peer-db-01"; device_class = "node"; dns_name = "peer-db-01.local" },
+                [PSCustomObject]@{ id = 2003; ipaddr4 = "10.0.0.1"; ipaddr6 = ""; display_name = "gateway"; device_class = "gateway"; dns_name = "gateway.local" }
+            )
+            edges = @(
+                [PSCustomObject]@{ from = 1001; to = 2001; weight = 3145728; protocols = @("HTTP", "HTTPS"); annotations = [PSCustomObject]@{ protocols = @("HTTP", "HTTPS"); appearances = [PSCustomObject]@{ from = "2026-04-27T10:00:00Z"; until = "2026-04-28T09:00:00Z" } } },
+                [PSCustomObject]@{ from = 2002; to = 1001; weight = 655360; protocols = @("TCP"); annotations = [PSCustomObject]@{ protocols = @("TCP", "DNS"); appearances = [PSCustomObject]@{ from = "2026-04-27T12:00:00Z"; until = "2026-04-28T08:30:00Z" } } },
+                [PSCustomObject]@{ from = 1001; to = 2003; weight = 12582912; protocols = @("TCP"); annotations = [PSCustomObject]@{ protocols = @("TCP"); appearances = [PSCustomObject]@{ from = "2026-04-26T00:00:00Z"; until = "2026-04-28T09:30:00Z" } } }
+            )
+        }
+    }
+
+    # POST /api/v1/metrics
+    if ($Uri -match "/api/v1/metrics" -and $Method -eq "POST") {
+        return [PSCustomObject]@{
+            stats = @(
+                [PSCustomObject]@{ oid = 1001; time = 1700000000000; duration = 30000; values = @(5242880, 10485760, 5120, 10240) },
+                [PSCustomObject]@{ oid = 1001; time = 1700000030000; duration = 30000; values = @(2621440, 5242880, 2560, 5120) }
+            )
+        }
+    }
+
+    throw "Unexpected API call: $Method $Uri"
+}
+
+# Set environment and run
 $env:EXTRAHOP_HOST = "https://extrahop-mock.local"
 $env:EXTRAHOP_API_KEY = "mock-api-key-12345"
 $env:EXTRAHOP_VERIFY_SSL = "true"
 $env:EXTRAHOP_LOOKBACK_MINUTES = "1440"
 $env:EXTRAHOP_OUTPUT_DIR = Join-Path $scriptDir "output"
 
-# We need to mock the API functions. We'll dot-source the script with a mock approach.
-# Since the script calls exit on missing API key and runs immediately, we'll use a different approach:
-# Source just the functions, then mock the HTTP layer.
-
-# Create a wrapper that overrides Invoke-EHRequest to return mock data
-$mockScript = @'
-# Override the base HTTP function to return mock data
-function Invoke-EHRequest {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Endpoint,
-        [Parameter()][string]$Method = "GET",
-        [Parameter()][object]$Body,
-        [Parameter()][int]$MaxRetries = 3
-    )
-
-    # Mock device search
-    if ($Endpoint -match "/api/v1/devices\?search_type") {
-        $ip = if ($Endpoint -match "value=([^&]+)") { [System.Uri]::UnescapeDataString($Matches[1]) } else { "" }
-
-        # Simulate not-found for third device
-        if ($ip -eq "10.1.1.52") {
-            return @{ Success = $false; StatusCode = 404; Error = "No device found for IP $ip" }
-        }
-
-        $deviceId = if ($ip -eq "10.1.1.50") { 1001 } else { 1002 }
-        $mockDevice = [PSCustomObject]@{
-            id           = $deviceId
-            ipaddr4      = $ip
-            ipaddr6      = ""
-            display_name = "mock-device-$deviceId"
-            device_class = "node"
-            dns_name     = "mock-$deviceId.local"
-            mod_time     = (Get-Date).ToFileTimeUtc()
-        }
-        return @{ Success = $true; Data = @($mockDevice); StatusCode = 200 }
-    }
-
-    # Mock peers
-    if ($Endpoint -match "/api/v1/devices/(\d+)/peers") {
-        $mockPeers = @(
-            [PSCustomObject]@{
-                ipaddr4      = "192.168.1.10"
-                ipaddr6      = ""
-                dns_name     = "peer-web-01.local"
-                display_name = "peer-web-01"
-                device_class = "node"
-                role         = "server"
-                bytes_in     = 1048576
-                bytes_out    = 2097152
-                pkts_in      = 1024
-                pkts_out     = 2048
-                first_seen   = "2026-04-27T10:00:00Z"
-                last_seen    = "2026-04-28T09:00:00Z"
-                protocols    = $null
-            },
-            [PSCustomObject]@{
-                ipaddr4      = "192.168.1.20"
-                ipaddr6      = ""
-                dns_name     = "peer-db-01.local"
-                display_name = "peer-db-01"
-                device_class = "node"
-                role         = "client"
-                bytes_in     = 524288
-                bytes_out    = 131072
-                pkts_in      = 512
-                pkts_out     = 128
-                first_seen   = "2026-04-27T12:00:00Z"
-                last_seen    = "2026-04-28T08:30:00Z"
-                protocols    = $null
-            },
-            [PSCustomObject]@{
-                ipaddr4      = "10.0.0.1"
-                ipaddr6      = ""
-                dns_name     = "gateway.local"
-                display_name = "gateway"
-                device_class = "gateway"
-                role         = "other"
-                bytes_in     = 8388608
-                bytes_out    = 4194304
-                pkts_in      = 8192
-                pkts_out     = 4096
-                first_seen   = "2026-04-26T00:00:00Z"
-                last_seen    = "2026-04-28T09:30:00Z"
-                protocols    = $null
-            }
-        )
-        return @{ Success = $true; Data = $mockPeers; StatusCode = 200 }
-    }
-
-    # Mock protocols
-    if ($Endpoint -match "/api/v1/devices/(\d+)/protocols") {
-        $mockProtos = @(
-            [PSCustomObject]@{ proto = "HTTPS"; port = "443" },
-            [PSCustomObject]@{ proto = "HTTP"; port = "80" },
-            [PSCustomObject]@{ proto = "SSH"; port = "22" },
-            [PSCustomObject]@{ proto = "DNS"; port = "53" }
-        )
-        return @{ Success = $true; Data = $mockProtos; StatusCode = 200 }
-    }
-
-    # Mock metrics
-    if ($Endpoint -eq "/api/v1/metrics") {
-        $mockMetrics = [PSCustomObject]@{
-            stats = @(
-                [PSCustomObject]@{ values = @(5242880, 10485760, 5120, 10240) }
-            )
-        }
-        return @{ Success = $true; Data = $mockMetrics; StatusCode = 200 }
-    }
-
-    return @{ Success = $false; StatusCode = 404; Error = "Unknown endpoint" }
-}
+& (Join-Path $scriptDir "Invoke-ExtraHopCommsMap.ps1") -InputCsv (Join-Path $scriptDir "input/servers.csv")
 '@
-
-# Write a temp runner script that sources the main script with mocked Invoke-EHRequest
-$runnerPath = Join-Path $scriptDir "_test_runner.ps1"
-$mainContent = Get-Content $scriptPath -Raw
-
-# Replace the Invoke-EHRequest function with our mock, then run
-# Strategy: dot-source the script but intercept at the function level
-# Simpler: just inject the mock before calling
-
-$runnerContent = @"
-Set-StrictMode -Version Latest
-`$ErrorActionPreference = "Stop"
-
-# Mock Invoke-RestMethod globally
-function Invoke-RestMethod {
-    param([string]`$Uri, [string]`$Method, [hashtable]`$Headers, [string]`$ContentType, [string]`$Body, [switch]`$SkipCertificateCheck)
-    throw "Invoke-RestMethod should not be called in mock mode"
-}
-
-# Source the mock functions
-$mockScript
-
-# Now source everything from the main script EXCEPT Invoke-EHRequest and the main execution
-# Instead, let's just run the main script with a pre-loaded mock
-
-# Set config
-`$env:EXTRAHOP_HOST = "https://extrahop-mock.local"
-`$env:EXTRAHOP_API_KEY = "mock-api-key-12345"
-`$env:EXTRAHOP_VERIFY_SSL = "true"
-`$env:EXTRAHOP_LOOKBACK_MINUTES = "1440"
-`$env:EXTRAHOP_OUTPUT_DIR = "$($scriptDir.Replace('\','/'))/output"
-"@
-
-# Actually, the simplest approach: override Invoke-RestMethod at the PowerShell level
-# and let the real script call through. But that's complex with the error handling.
-# Let's use a different approach: manually run the data pipeline with mocks.
-
-$testContent = @"
-Set-StrictMode -Version Latest
-`$ErrorActionPreference = "Stop"
-
-`$scriptDir = "$($scriptDir.Replace('\','\\'))"
-
-# Load the script's functions by dot-sourcing in a special way
-# We'll parse and extract functions, then override Invoke-EHRequest
-
-`$env:EXTRAHOP_HOST = "https://extrahop-mock.local"
-`$env:EXTRAHOP_API_KEY = "mock-api-key-12345"
-`$env:EXTRAHOP_VERIFY_SSL = "true"
-`$env:EXTRAHOP_LOOKBACK_MINUTES = "1440"
-`$env:EXTRAHOP_OUTPUT_DIR = Join-Path `$scriptDir "output"
-
-# Source the script content as a script block, but we need to mock Invoke-RestMethod
-# Simplest: just replace Invoke-RestMethod with a mock that returns appropriate data
-
-function Global:Invoke-RestMethod {
-    param(
-        [string]`$Uri,
-        [string]`$Method = "GET",
-        [hashtable]`$Headers,
-        [string]`$ContentType,
-        [string]`$Body,
-        [switch]`$SkipCertificateCheck,
-        [string]`$ErrorAction
-    )
-
-    # Mock device search
-    if (`$Uri -match "/api/v1/devices\?search_type") {
-        `$ip = if (`$Uri -match "value=([^&]+)") { [System.Uri]::UnescapeDataString(`$Matches[1]) } else { "" }
-        if (`$ip -eq "10.1.1.52") { throw "The remote server returned an error: (404) Not Found." }
-        `$deviceId = if (`$ip -eq "10.1.1.50") { 1001 } else { 1002 }
-        return @([PSCustomObject]@{
-            id = `$deviceId; ipaddr4 = `$ip; ipaddr6 = ""; display_name = "mock-device-`$deviceId"
-            device_class = "node"; dns_name = "mock-`$deviceId.local"; mod_time = (Get-Date).Ticks
-        })
-    }
-
-    # Mock peers
-    if (`$Uri -match "/api/v1/devices/\d+/peers") {
-        return @(
-            [PSCustomObject]@{ ipaddr4="192.168.1.10"; ipaddr6=""; dns_name="peer-web-01.local"; display_name="peer-web-01"; device_class="node"; role="server"; bytes_in=1048576; bytes_out=2097152; pkts_in=1024; pkts_out=2048; first_seen="2026-04-27T10:00:00Z"; last_seen="2026-04-28T09:00:00Z"; protocols=`$null },
-            [PSCustomObject]@{ ipaddr4="192.168.1.20"; ipaddr6=""; dns_name="peer-db-01.local"; display_name="peer-db-01"; device_class="node"; role="client"; bytes_in=524288; bytes_out=131072; pkts_in=512; pkts_out=128; first_seen="2026-04-27T12:00:00Z"; last_seen="2026-04-28T08:30:00Z"; protocols=`$null },
-            [PSCustomObject]@{ ipaddr4="10.0.0.1"; ipaddr6=""; dns_name="gateway.local"; display_name="gateway"; device_class="gateway"; role="other"; bytes_in=8388608; bytes_out=4194304; pkts_in=8192; pkts_out=4096; first_seen="2026-04-26T00:00:00Z"; last_seen="2026-04-28T09:30:00Z"; protocols=`$null }
-        )
-    }
-
-    # Mock protocols
-    if (`$Uri -match "/api/v1/devices/\d+/protocols") {
-        return @(
-            [PSCustomObject]@{ proto="HTTPS"; port="443" },
-            [PSCustomObject]@{ proto="HTTP"; port="80" },
-            [PSCustomObject]@{ proto="SSH"; port="22" },
-            [PSCustomObject]@{ proto="DNS"; port="53" }
-        )
-    }
-
-    # Mock metrics
-    if (`$Uri -match "/api/v1/metrics") {
-        return [PSCustomObject]@{ stats = @([PSCustomObject]@{ values = @(5242880, 10485760, 5120, 10240) }) }
-    }
-
-    throw "Unexpected URI: `$Uri"
-}
-
-# Now run the actual script
-& (Join-Path `$scriptDir "Invoke-ExtraHopCommsMap.ps1") -InputCsv (Join-Path `$scriptDir "input/servers.csv")
-"@
 
 Set-Content -Path $runnerPath -Value $testContent -Encoding UTF8
 
-Write-Host "  Running dry-run with mocked API..." -ForegroundColor Yellow
+Write-Host "  Running dry-run with mocked API (activitymaps/query model)..." -ForegroundColor Yellow
 try {
     & pwsh -NoProfile -File $runnerPath 2>&1 | ForEach-Object { Write-Host "  $_" }
     $dryRunSuccess = $true
@@ -291,20 +193,23 @@ if ($csvExists) {
     $csvContent = Import-Csv $csvPath
     Write-Host "  CSV rows: $($csvContent.Count)" -ForegroundColor Green
     Write-Host "  CSV columns: $(($csvContent[0].PSObject.Properties | Measure-Object).Count)" -ForegroundColor Green
+    Write-Host "  Sample source IPs: $(($csvContent | Select-Object -ExpandProperty source_ip -Unique) -join ', ')" -ForegroundColor Green
 }
 
 if ($htmlExists) {
     $htmlContent = Get-Content $htmlPath -Raw
-    $hasTitle = $htmlContent -match "ExtraHop Communication Map"
-    $hasFilterBar = $htmlContent -match "filter-bar"
-    $hasCards = $htmlContent -match "device-card"
-    $hasThemeToggle = $htmlContent -match "toggleTheme"
-    $hasSortable = $htmlContent -match "data-sort"
-    Write-Host "  HTML has title: $hasTitle" -ForegroundColor $(if ($hasTitle) { "Green" } else { "Red" })
-    Write-Host "  HTML has filter bar: $hasFilterBar" -ForegroundColor $(if ($hasFilterBar) { "Green" } else { "Red" })
-    Write-Host "  HTML has device cards: $hasCards" -ForegroundColor $(if ($hasCards) { "Green" } else { "Red" })
-    Write-Host "  HTML has theme toggle: $hasThemeToggle" -ForegroundColor $(if ($hasThemeToggle) { "Green" } else { "Red" })
-    Write-Host "  HTML has sortable cols: $hasSortable" -ForegroundColor $(if ($hasSortable) { "Green" } else { "Red" })
+    $checks = @{
+        "Title"        = $htmlContent -match "ExtraHop Communication Map"
+        "Filter bar"   = $htmlContent -match "filter-bar"
+        "Device cards" = $htmlContent -match "device-card"
+        "Theme toggle" = $htmlContent -match "toggleTheme"
+        "Sortable cols" = $htmlContent -match "data-sort"
+        "KPI cards"    = $htmlContent -match "kpi-card"
+        "Warnings"     = $htmlContent -match "warnings"
+    }
+    foreach ($check in $checks.GetEnumerator()) {
+        Write-Host "  HTML has $($check.Key): $($check.Value)" -ForegroundColor $(if ($check.Value) { "Green" } else { "Red" })
+    }
 }
 
 Write-Host "`n=== VALIDATION STEP 4: File Tree ===" -ForegroundColor Cyan
