@@ -73,22 +73,16 @@ function Disable-SslVerification {
     #>
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         # PS7+ handles this per-request with -SkipCertificateCheck
-        Write-Verbose "PowerShell 7+ detected — will use -SkipCertificateCheck on requests"
+        Write-Verbose "PowerShell 7+ detected -- will use -SkipCertificateCheck on requests"
     }
     else {
         # PS5.1: override the validation callback
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) { return true; }
-}
-"@
+        # Note: C# code passed as string to avoid PS parsing 'using' as a PowerShell directive
+        $csSource = 'using System.Net;using System.Security.Cryptography.X509Certificates;public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }'
+        Add-Type -TypeDefinition $csSource
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-        Write-Verbose "PowerShell 5.1 detected — SSL validation disabled via CertificatePolicy"
+        Write-Verbose "PowerShell 5.1 detected -- SSL validation disabled via CertificatePolicy"
     }
 }
 
