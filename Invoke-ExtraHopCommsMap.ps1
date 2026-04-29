@@ -272,51 +272,145 @@ function Resolve-EHDevice {
     return @{ Success = $false; StatusCode = 404; Error = "No device found for $identifier" }
 }
 
-function Get-EHDevicePeerMetrics {
+function Get-EHDevicePeerRecords {
     <#
     .SYNOPSIS
-        Discovers peers via POST /metrics using detail metrics that break down
-        traffic by peer IP address. Tries multiple metric categories in order
-        of reliability: net_detail, tcp, net.
-        Returns the raw metrics response with per-peer key/value breakdowns.
+        Discovers peers with port data via POST /records/search.
+        Searches for flow records involving the device IP, returning
+        peer IPs, ports, protocols, and byte counts.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][long]$DeviceId)
+    param(
+        [Parameter(Mandatory)][string]$DeviceIp,
+        [Parameter()][int]$Limit = 10000
+    )
 
-    # Try detail metric categories that break down by peer IP
-    $categories = @("net_detail", "tcp", "net")
-
-    foreach ($category in $categories) {
-        $body = @{
-            cycle           = "auto"
-            from            = -$script:LookbackMs
-            until           = 0
-            metric_category = $category
-            metric_specs    = @(
-                @{ name = "bytes_out" }
-            )
-            object_type     = "device"
-            object_ids      = @($DeviceId)
-        }
-
-        $result = Invoke-EHRequest -Endpoint "/api/v1/metrics" -Method "POST" -Body $body
-        if ($result.Success -and $result.Data -and $result.Data.stats) {
-            # Check if this response has detail (per-peer) data
-            # Detail metrics have values that are arrays of {key:{...}, value:N} objects
-            # Aggregate metrics have values that are simple numbers
-            $firstStat = $result.Data.stats | Select-Object -First 1
-            if ($firstStat -and $firstStat.values) {
-                $firstVal = $firstStat.values | Select-Object -First 1
-                # Detail metric: value is an object with .key property
-                if ($firstVal -and $firstVal.key) {
-                    Write-Verbose "  Peer detail found via metric_category=$category"
-                    return @{ Success = $true; Data = $result.Data; Category = $category; StatusCode = 200 }
+    $body = @{
+        from  = -$script:LookbackMs
+        until = 0
+        limit = $Limit
+        filter = @{
+            operator = "or"
+            rules    = @(
+                @{
+                    field    = "clientAddr"
+                    operator = "="
+                    operand  = $DeviceIp
+                },
+                @{
+                    field    = "serverAddr"
+                    operator = "="
+                    operand  = $DeviceIp
+                },
+                @{
+                    field    = "senderAddr"
+                    operator = "="
+                    operand  = $DeviceIp
+                },
+                @{
+                    field    = "receiverAddr"
+                    operator = "="
+                    operand  = $DeviceIp
                 }
-            }
+            )
         }
     }
 
-    return @{ Success = $false; StatusCode = 404; Error = "No detail peer metrics found" }
+    return Invoke-EHRequest -Endpoint "/api/v1/records/search" -Method "POST" -Body $body
+}
+
+function ConvertFrom-RecordSearch {
+    <#
+    .SYNOPSIS
+        Parses POST /records/search response into a peer map with IP, port, protocol, and bytes.
+        Records contain fields like clientAddr, serverAddr, clientPort, serverPort, proto, bytes.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$RecordsData,
+        [Parameter(Mandatory)][string]$DeviceIp
+    )
+
+    # Build a map: peerIp -> { ports: set, protocols: set, bytes_in: N, bytes_out: N, role: str }
+    $peerMap = @{}
+
+    $records = if ($RecordsData.records) { $RecordsData.records } elseif ($RecordsData -is [array]) { $RecordsData } else { @() }
+
+    foreach ($rec in $records) {
+        # Extract fields - records use various field naming conventions
+        $clientAddr = if ($rec.clientAddr) { $rec.clientAddr } elseif ($rec."client.addr") { $rec."client.addr" } elseif ($rec._source -and $rec._source.clientAddr) { $rec._source.clientAddr } else { "" }
+        $serverAddr = if ($rec.serverAddr) { $rec.serverAddr } elseif ($rec."server.addr") { $rec."server.addr" } elseif ($rec._source -and $rec._source.serverAddr) { $rec._source.serverAddr } else { "" }
+        $senderAddr = if ($rec.senderAddr) { $rec.senderAddr } elseif ($rec."sender.addr") { $rec."sender.addr" } else { "" }
+        $receiverAddr = if ($rec.receiverAddr) { $rec.receiverAddr } elseif ($rec."receiver.addr") { $rec."receiver.addr" } else { "" }
+
+        $clientPort = if ($rec.clientPort) { $rec.clientPort } elseif ($rec."client.port") { $rec."client.port" } elseif ($rec._source -and $rec._source.clientPort) { $rec._source.clientPort } else { "" }
+        $serverPort = if ($rec.serverPort) { $rec.serverPort } elseif ($rec."server.port") { $rec."server.port" } elseif ($rec._source -and $rec._source.serverPort) { $rec._source.serverPort } else { "" }
+        $senderPort = if ($rec.senderPort) { $rec.senderPort } elseif ($rec."sender.port") { $rec."sender.port" } else { "" }
+        $receiverPort = if ($rec.receiverPort) { $rec.receiverPort } elseif ($rec."receiver.port") { $rec."receiver.port" } else { "" }
+
+        $proto = if ($rec.proto) { $rec.proto } elseif ($rec.protocol) { $rec.protocol } elseif ($rec._source -and $rec._source.proto) { $rec._source.proto } else { "" }
+
+        $bytesIn = 0; $bytesOut = 0
+        try { $bytesIn = if ($rec.bytesIn) { [long]$rec.bytesIn } elseif ($rec.bytes_in) { [long]$rec.bytes_in } elseif ($rec._source -and $rec._source.bytesIn) { [long]$rec._source.bytesIn } else { 0 } } catch {}
+        try { $bytesOut = if ($rec.bytesOut) { [long]$rec.bytesOut } elseif ($rec.bytes_out) { [long]$rec.bytes_out } elseif ($rec._source -and $rec._source.bytesOut) { [long]$rec._source.bytesOut } else { 0 } } catch {}
+
+        # Also try generic bytes field
+        if ($bytesIn -eq 0 -and $bytesOut -eq 0) {
+            try {
+                $totalBytes = if ($rec.bytes) { [long]$rec.bytes } elseif ($rec._source -and $rec._source.bytes) { [long]$rec._source.bytes } else { 0 }
+                $bytesOut = $totalBytes
+            }
+            catch {}
+        }
+
+        # Determine peer and direction
+        $peerIp = ""; $peerPort = ""; $role = ""; $direction = ""
+
+        # Check client/server pattern
+        if ($clientAddr -eq $DeviceIp -and $serverAddr) {
+            $peerIp = $serverAddr; $peerPort = $serverPort; $role = "server"; $direction = "outbound"
+        }
+        elseif ($serverAddr -eq $DeviceIp -and $clientAddr) {
+            $peerIp = $clientAddr; $peerPort = $clientPort; $role = "client"; $direction = "inbound"
+            # Swap bytes perspective
+            $tmp = $bytesIn; $bytesIn = $bytesOut; $bytesOut = $tmp
+        }
+        # Check sender/receiver pattern
+        elseif ($senderAddr -eq $DeviceIp -and $receiverAddr) {
+            $peerIp = $receiverAddr; $peerPort = $receiverPort; $role = "server"; $direction = "outbound"
+        }
+        elseif ($receiverAddr -eq $DeviceIp -and $senderAddr) {
+            $peerIp = $senderAddr; $peerPort = $senderPort; $role = "client"; $direction = "inbound"
+            $tmp = $bytesIn; $bytesIn = $bytesOut; $bytesOut = $tmp
+        }
+
+        if (-not $peerIp) { continue }
+
+        # Build unique key per peer IP
+        if (-not $peerMap.ContainsKey($peerIp)) {
+            $peerMap[$peerIp] = @{
+                ports     = [System.Collections.Generic.HashSet[string]]::new()
+                protocols = [System.Collections.Generic.HashSet[string]]::new()
+                bytes_in  = [long]0
+                bytes_out = [long]0
+                role      = $role
+                direction = $direction
+            }
+        }
+
+        $peer = $peerMap[$peerIp]
+        if ($peerPort) { [void]$peer.ports.Add([string]$peerPort) }
+        if ($proto) { [void]$peer.protocols.Add([string]$proto) }
+        $peer.bytes_in += $bytesIn
+        $peer.bytes_out += $bytesOut
+        # If we see both directions, mark as bidirectional
+        if ($peer.direction -ne $direction -and $peer.direction -ne "bidirectional") {
+            $peer.direction = "bidirectional"
+            $peer.role = "any"
+        }
+    }
+
+    return $peerMap
 }
 
 function Get-EHDeviceActivity {
@@ -608,30 +702,38 @@ function Invoke-EHDataCollection {
         # If resolved by hostname and we didn't have an IP, populate from ExtraHop
         if (-not $ip -and $ehDevice.ipaddr4) { $ip = $ehDevice.ipaddr4 }
 
-        # === PEER DISCOVERY via detail metrics ===
-        # Detail metrics break down traffic by peer IP in the key field
-        $peerResult = Get-EHDevicePeerMetrics -DeviceId $deviceId
+        # === PEER DISCOVERY via records search ===
+        # Records contain flow data with peer IPs, ports, protocols, and bytes
+        $sourceIpForSearch = if ($ip) { $ip } elseif ($ehDevice.ipaddr4) { $ehDevice.ipaddr4 } else { "" }
         $peerMap = @{}
-        if ($peerResult.Success -and $peerResult.Data) {
-            # Diagnostic: always dump first successful detail response
-            if (-not $script:detailDumped) {
-                $script:detailDumped = $true
-                $dumpPath = Join-Path $script:Config.OutputDir "debug_detail_metrics.json"
+        if ($sourceIpForSearch) {
+            $recordsResult = Get-EHDevicePeerRecords -DeviceIp $sourceIpForSearch
+            if ($recordsResult.Success -and $recordsResult.Data) {
+                # Diagnostic: dump first response
+                if (-not $script:detailDumped) {
+                    $script:detailDumped = $true
+                    $dumpPath = Join-Path $script:Config.OutputDir "debug_records_response.json"
+                    try {
+                        $recordsResult.Data | ConvertTo-Json -Depth 20 -Compress | Out-File -FilePath $dumpPath -Encoding UTF8
+                        Write-Host "  DEBUG: records response dumped to $dumpPath" -ForegroundColor Magenta
+                    }
+                    catch {
+                        try {
+                            $dumpPath = Join-Path $script:Config.OutputDir "debug_records_response.txt"
+                            "$($recordsResult.Data.GetType().FullName)`n---`n$($recordsResult.Data | Out-String -Width 500)" | Out-File -FilePath $dumpPath -Encoding UTF8
+                            Write-Host "  DEBUG: raw response dumped to $dumpPath" -ForegroundColor Magenta
+                        } catch {}
+                    }
+                }
                 try {
-                    $peerResult.Data | ConvertTo-Json -Depth 20 | Out-File -FilePath $dumpPath -Encoding UTF8
-                    Write-Host "  DEBUG: detail metrics (category=$($peerResult.Category)) dumped to $dumpPath" -ForegroundColor Magenta
+                    $peerMap = ConvertFrom-RecordSearch -RecordsData $recordsResult.Data -DeviceIp $sourceIpForSearch
                 }
                 catch {
-                    $dumpPath = Join-Path $script:Config.OutputDir "debug_detail_metrics.txt"
-                    try { "$($peerResult.Data.GetType().FullName)`n---`n$($peerResult.Data | Out-String)" | Out-File -FilePath $dumpPath -Encoding UTF8 } catch {}
-                    Write-Host "  DEBUG: raw response dumped to $dumpPath" -ForegroundColor Magenta
+                    Write-Host "  WARN: Failed to parse records: $_" -ForegroundColor Yellow
                 }
             }
-            try {
-                $peerMap = ConvertFrom-DetailMetrics -MetricsData $peerResult.Data
-            }
-            catch {
-                Write-Host "  WARN: Failed to parse detail metrics: $_" -ForegroundColor Yellow
+            elseif (-not $recordsResult.Success) {
+                Write-Verbose "  Records search failed: $($recordsResult.Error)"
             }
         }
 
@@ -689,9 +791,9 @@ function Invoke-EHDataCollection {
             continue
         }
 
-        # Process each peer from the detail metrics
+        # Process each peer from the records
         foreach ($peerAddr in $peerMap.Keys) {
-            $peerBytesOut = $peerMap[$peerAddr]
+            $peerData = $peerMap[$peerAddr]
 
             # Try to resolve peer IP to a device in ExtraHop (with caching)
             $peerHostname = ""; $peerDisplayName = ""; $peerDeviceType = ""
@@ -719,9 +821,10 @@ function Invoke-EHDataCollection {
                 }
             }
 
-            # Direction: we queried bytes_out from source, so these are outbound peers
-            $direction = "outbound"
-            $peerRole = "server"
+            # Ports and protocols from record data
+            $peerPorts = ($peerData.ports | Sort-Object { try { [int]$_ } catch { $_ } }) -join ", "
+            $peerProtos = ($peerData.protocols | Sort-Object) -join ", "
+            if (-not $peerProtos) { $peerProtos = $protoString }
 
             [void]$results.Add([PSCustomObject]@{
                 source_ip                    = $ip
@@ -733,12 +836,12 @@ function Invoke-EHDataCollection {
                 peer_hostname                = $peerHostname
                 peer_extrahop_display_name   = $peerDisplayName
                 peer_extrahop_device_type    = $peerDeviceType
-                peer_role                    = $peerRole
-                traffic_direction            = $direction
-                protocols                    = $protoString
-                ports                        = ""
-                bytes_in                     = 0
-                bytes_out                    = $peerBytesOut
+                peer_role                    = $peerData.role
+                traffic_direction            = $peerData.direction
+                protocols                    = $peerProtos
+                ports                        = $peerPorts
+                bytes_in                     = $peerData.bytes_in
+                bytes_out                    = $peerData.bytes_out
                 pkts_in                      = 0
                 pkts_out                     = 0
                 first_seen                   = ""
