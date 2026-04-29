@@ -319,11 +319,39 @@ function Get-EHDevicePeerRecords {
     return Invoke-EHRequest -Endpoint "/api/v1/records/search" -Method "POST" -Body $body
 }
 
+function Get-RecordField {
+    <#
+    .SYNOPSIS
+        Safely extracts a field value from a record object, trying multiple
+        possible field names. Returns empty string if not found.
+        Works with strict mode by using PSObject.Properties lookup.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Record,
+        [Parameter(Mandatory)][string[]]$FieldNames
+    )
+
+    foreach ($name in $FieldNames) {
+        # Check top-level property
+        $prop = $Record.PSObject.Properties[$name]
+        if ($prop -and $null -ne $prop.Value) { return $prop.Value }
+
+        # Check _source wrapper
+        $sourceProp = $Record.PSObject.Properties["_source"]
+        if ($sourceProp -and $null -ne $sourceProp.Value) {
+            $innerProp = $sourceProp.Value.PSObject.Properties[$name]
+            if ($innerProp -and $null -ne $innerProp.Value) { return $innerProp.Value }
+        }
+    }
+    return ""
+}
+
 function ConvertFrom-RecordSearch {
     <#
     .SYNOPSIS
         Parses POST /records/search response into a peer map with IP, port, protocol, and bytes.
-        Records contain fields like clientAddr, serverAddr, clientPort, serverPort, proto, bytes.
+        Uses safe property access to handle any field naming convention ExtraHop uses.
     #>
     [CmdletBinding()]
     param(
@@ -331,51 +359,72 @@ function ConvertFrom-RecordSearch {
         [Parameter(Mandatory)][string]$DeviceIp
     )
 
-    # Build a map: peerIp -> { ports: set, protocols: set, bytes_in: N, bytes_out: N, role: str }
     $peerMap = @{}
 
-    $records = if ($RecordsData.records) { $RecordsData.records } elseif ($RecordsData -is [array]) { $RecordsData } else { @() }
+    $records = if ($RecordsData.PSObject.Properties["records"] -and $RecordsData.records) {
+        $RecordsData.records
+    } elseif ($RecordsData -is [array]) {
+        $RecordsData
+    } else { @() }
+
+    # Diagnostic: dump field names from first record
+    if (($records | Measure-Object).Count -gt 0) {
+        $firstRec = $records | Select-Object -First 1
+        $fieldNames = $firstRec.PSObject.Properties | ForEach-Object { $_.Name }
+        Write-Host "  Record fields: $($fieldNames -join ', ')" -ForegroundColor DarkGray
+
+        # If _source exists, show its fields too
+        $srcProp = $firstRec.PSObject.Properties["_source"]
+        if ($srcProp -and $null -ne $srcProp.Value) {
+            $srcFields = $srcProp.Value.PSObject.Properties | ForEach-Object { $_.Name }
+            Write-Host "  _source fields: $($srcFields -join ', ')" -ForegroundColor DarkGray
+        }
+    }
 
     foreach ($rec in $records) {
-        # Extract fields - records use various field naming conventions
-        $clientAddr = if ($rec.clientAddr) { $rec.clientAddr } elseif ($rec."client.addr") { $rec."client.addr" } elseif ($rec._source -and $rec._source.clientAddr) { $rec._source.clientAddr } else { "" }
-        $serverAddr = if ($rec.serverAddr) { $rec.serverAddr } elseif ($rec."server.addr") { $rec."server.addr" } elseif ($rec._source -and $rec._source.serverAddr) { $rec._source.serverAddr } else { "" }
-        $senderAddr = if ($rec.senderAddr) { $rec.senderAddr } elseif ($rec."sender.addr") { $rec."sender.addr" } else { "" }
-        $receiverAddr = if ($rec.receiverAddr) { $rec.receiverAddr } elseif ($rec."receiver.addr") { $rec."receiver.addr" } else { "" }
+        # Extract addresses - try all known naming patterns
+        $clientAddr  = Get-RecordField $rec @("clientAddr", "client.addr", "client_addr", "src", "srcAddr", "source", "sourceAddr")
+        $serverAddr  = Get-RecordField $rec @("serverAddr", "server.addr", "server_addr", "dst", "dstAddr", "destination", "destAddr")
+        $senderAddr  = Get-RecordField $rec @("senderAddr", "sender.addr", "sender_addr")
+        $receiverAddr = Get-RecordField $rec @("receiverAddr", "receiver.addr", "receiver_addr")
 
-        $clientPort = if ($rec.clientPort) { $rec.clientPort } elseif ($rec."client.port") { $rec."client.port" } elseif ($rec._source -and $rec._source.clientPort) { $rec._source.clientPort } else { "" }
-        $serverPort = if ($rec.serverPort) { $rec.serverPort } elseif ($rec."server.port") { $rec."server.port" } elseif ($rec._source -and $rec._source.serverPort) { $rec._source.serverPort } else { "" }
-        $senderPort = if ($rec.senderPort) { $rec.senderPort } elseif ($rec."sender.port") { $rec."sender.port" } else { "" }
-        $receiverPort = if ($rec.receiverPort) { $rec.receiverPort } elseif ($rec."receiver.port") { $rec."receiver.port" } else { "" }
+        # Extract ports
+        $clientPort  = Get-RecordField $rec @("clientPort", "client.port", "client_port", "srcPort", "src_port", "sourcePort")
+        $serverPort  = Get-RecordField $rec @("serverPort", "server.port", "server_port", "dstPort", "dst_port", "destPort", "port")
+        $senderPort  = Get-RecordField $rec @("senderPort", "sender.port", "sender_port")
+        $receiverPort = Get-RecordField $rec @("receiverPort", "receiver.port", "receiver_port")
 
-        $proto = if ($rec.proto) { $rec.proto } elseif ($rec.protocol) { $rec.protocol } elseif ($rec._source -and $rec._source.proto) { $rec._source.proto } else { "" }
+        # Extract protocol
+        $proto = Get-RecordField $rec @("proto", "protocol", "l7proto", "ex.type", "type")
 
-        $bytesIn = 0; $bytesOut = 0
-        try { $bytesIn = if ($rec.bytesIn) { [long]$rec.bytesIn } elseif ($rec.bytes_in) { [long]$rec.bytes_in } elseif ($rec._source -and $rec._source.bytesIn) { [long]$rec._source.bytesIn } else { 0 } } catch {}
-        try { $bytesOut = if ($rec.bytesOut) { [long]$rec.bytesOut } elseif ($rec.bytes_out) { [long]$rec.bytes_out } elseif ($rec._source -and $rec._source.bytesOut) { [long]$rec._source.bytesOut } else { 0 } } catch {}
+        # Extract bytes
+        $bytesIn = [long]0; $bytesOut = [long]0
+        try {
+            $bi = Get-RecordField $rec @("bytesIn", "bytes_in", "clientBytes", "client_bytes", "rxBytes")
+            if ($bi) { $bytesIn = [long]$bi }
+        } catch {}
+        try {
+            $bo = Get-RecordField $rec @("bytesOut", "bytes_out", "serverBytes", "server_bytes", "txBytes")
+            if ($bo) { $bytesOut = [long]$bo }
+        } catch {}
 
-        # Also try generic bytes field
         if ($bytesIn -eq 0 -and $bytesOut -eq 0) {
             try {
-                $totalBytes = if ($rec.bytes) { [long]$rec.bytes } elseif ($rec._source -and $rec._source.bytes) { [long]$rec._source.bytes } else { 0 }
-                $bytesOut = $totalBytes
-            }
-            catch {}
+                $tb = Get-RecordField $rec @("bytes", "totalBytes", "total_bytes")
+                if ($tb) { $bytesOut = [long]$tb }
+            } catch {}
         }
 
         # Determine peer and direction
         $peerIp = ""; $peerPort = ""; $role = ""; $direction = ""
 
-        # Check client/server pattern
         if ($clientAddr -eq $DeviceIp -and $serverAddr) {
             $peerIp = $serverAddr; $peerPort = $serverPort; $role = "server"; $direction = "outbound"
         }
         elseif ($serverAddr -eq $DeviceIp -and $clientAddr) {
             $peerIp = $clientAddr; $peerPort = $clientPort; $role = "client"; $direction = "inbound"
-            # Swap bytes perspective
             $tmp = $bytesIn; $bytesIn = $bytesOut; $bytesOut = $tmp
         }
-        # Check sender/receiver pattern
         elseif ($senderAddr -eq $DeviceIp -and $receiverAddr) {
             $peerIp = $receiverAddr; $peerPort = $receiverPort; $role = "server"; $direction = "outbound"
         }
@@ -386,7 +435,6 @@ function ConvertFrom-RecordSearch {
 
         if (-not $peerIp) { continue }
 
-        # Build unique key per peer IP
         if (-not $peerMap.ContainsKey($peerIp)) {
             $peerMap[$peerIp] = @{
                 ports     = [System.Collections.Generic.HashSet[string]]::new()
@@ -403,7 +451,6 @@ function ConvertFrom-RecordSearch {
         if ($proto) { [void]$peer.protocols.Add([string]$proto) }
         $peer.bytes_in += $bytesIn
         $peer.bytes_out += $bytesOut
-        # If we see both directions, mark as bidirectional
         if ($peer.direction -ne $direction -and $peer.direction -ne "bidirectional") {
             $peer.direction = "bidirectional"
             $peer.role = "any"
