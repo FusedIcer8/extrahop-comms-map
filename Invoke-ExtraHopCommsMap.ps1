@@ -380,7 +380,12 @@ function ConvertFrom-DetailMetrics {
     <#
     .SYNOPSIS
         Parses POST /metrics detail response into a list of peer IPs with byte counts.
-        Detail metrics return values as arrays of {key:{addr:"x.x.x.x"}, value:N} objects.
+
+        ExtraHop detail metrics response format:
+        stats[].values is an array where each element corresponds to a metric_spec.
+        For detail metrics, each element is itself an array of {key:{...}, value:N} entries.
+
+        Structure: stats[].values[metric_spec_index] = [ {key:{addr:"x.x.x.x"}, value:N}, ... ]
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$MetricsData)
@@ -391,34 +396,90 @@ function ConvertFrom-DetailMetrics {
 
     foreach ($stat in $MetricsData.stats) {
         if (-not $stat.values) { continue }
-        foreach ($entry in $stat.values) {
-            $peerAddr = $null
-            $bytes = 0
 
-            # Detail metric format: entry has .key and .value
-            if ($entry.key) {
-                # Key can be {addr:"x.x.x.x"} or {str:"hostname"} or just a string
-                if ($entry.key.addr) {
-                    $peerAddr = $entry.key.addr
-                }
-                elseif ($entry.key.str) {
-                    $peerAddr = $entry.key.str
-                }
-                elseif ($entry.key -is [string]) {
-                    $peerAddr = $entry.key
-                }
+        foreach ($metricValues in $stat.values) {
+            # metricValues could be:
+            # 1. A simple number (aggregate metric) — skip
+            # 2. An array of {key:{...}, value:N} objects (detail metric) — parse
 
-                $bytes = if ($entry.value) { [long]$entry.value } else { 0 }
+            if ($null -eq $metricValues) { continue }
+
+            # If it's a simple number, skip (aggregate metric, not detail)
+            if ($metricValues -is [int] -or $metricValues -is [long] -or $metricValues -is [double] -or $metricValues -is [decimal]) {
+                continue
             }
 
-            if ($peerAddr) {
-                if ($peerMap.ContainsKey($peerAddr)) {
-                    $peerMap[$peerAddr] += $bytes
+            # If it's an array, iterate over detail entries
+            if ($metricValues -is [array] -or $metricValues -is [System.Object[]]) {
+                foreach ($entry in $metricValues) {
+                    if ($null -eq $entry) { continue }
+
+                    $peerAddr = $null
+                    $bytes = [long]0
+
+                    # Try to extract peer address from key
+                    try {
+                        if ($entry.key) {
+                            if ($entry.key -is [string]) {
+                                $peerAddr = $entry.key
+                            }
+                            elseif ($entry.key.addr) {
+                                $peerAddr = $entry.key.addr
+                            }
+                            elseif ($entry.key.str) {
+                                $peerAddr = $entry.key.str
+                            }
+                            elseif ($entry.key.host) {
+                                $peerAddr = $entry.key.host
+                            }
+                        }
+                    }
+                    catch { continue }
+
+                    # Extract byte count
+                    try {
+                        if ($null -ne $entry.value) {
+                            if ($entry.value -is [array]) {
+                                # If value is itself an array, take the first element
+                                $bytes = [long]($entry.value | Select-Object -First 1)
+                            }
+                            else {
+                                $bytes = [long]$entry.value
+                            }
+                        }
+                    }
+                    catch { $bytes = 0 }
+
+                    if ($peerAddr) {
+                        if ($peerMap.ContainsKey($peerAddr)) {
+                            $peerMap[$peerAddr] += $bytes
+                        }
+                        else {
+                            $peerMap[$peerAddr] = $bytes
+                        }
+                    }
                 }
-                else {
-                    $peerMap[$peerAddr] = $bytes
+                continue
+            }
+
+            # If it's a single object with .key (rare but possible)
+            try {
+                if ($metricValues.key) {
+                    $peerAddr = $null
+                    if ($metricValues.key -is [string]) { $peerAddr = $metricValues.key }
+                    elseif ($metricValues.key.addr) { $peerAddr = $metricValues.key.addr }
+                    elseif ($metricValues.key.str) { $peerAddr = $metricValues.key.str }
+
+                    $bytes = [long]0
+                    try { $bytes = [long]$metricValues.value } catch {}
+
+                    if ($peerAddr) {
+                        if ($peerMap.ContainsKey($peerAddr)) { $peerMap[$peerAddr] += $bytes }
+                        else { $peerMap[$peerAddr] = $bytes }
+                    }
                 }
             }
+            catch { continue }
         }
     }
 
@@ -551,21 +612,26 @@ function Invoke-EHDataCollection {
         $peerResult = Get-EHDevicePeerMetrics -DeviceId $deviceId
         $peerMap = @{}
         if ($peerResult.Success -and $peerResult.Data) {
-            # Diagnostic: dump first successful detail response
-            if ($i -lt 3 -and -not $script:detailDumped) {
+            # Diagnostic: always dump first successful detail response
+            if (-not $script:detailDumped) {
                 $script:detailDumped = $true
                 $dumpPath = Join-Path $script:Config.OutputDir "debug_detail_metrics.json"
                 try {
-                    $peerResult.Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $dumpPath -Encoding UTF8
+                    $peerResult.Data | ConvertTo-Json -Depth 20 | Out-File -FilePath $dumpPath -Encoding UTF8
                     Write-Host "  DEBUG: detail metrics (category=$($peerResult.Category)) dumped to $dumpPath" -ForegroundColor Magenta
                 }
                 catch {
                     $dumpPath = Join-Path $script:Config.OutputDir "debug_detail_metrics.txt"
-                    "$($peerResult.Data.GetType().FullName)`n---`n$($peerResult.Data)" | Out-File -FilePath $dumpPath -Encoding UTF8
+                    try { "$($peerResult.Data.GetType().FullName)`n---`n$($peerResult.Data | Out-String)" | Out-File -FilePath $dumpPath -Encoding UTF8 } catch {}
                     Write-Host "  DEBUG: raw response dumped to $dumpPath" -ForegroundColor Magenta
                 }
             }
-            $peerMap = ConvertFrom-DetailMetrics -MetricsData $peerResult.Data
+            try {
+                $peerMap = ConvertFrom-DetailMetrics -MetricsData $peerResult.Data
+            }
+            catch {
+                Write-Host "  WARN: Failed to parse detail metrics: $_" -ForegroundColor Yellow
+            }
         }
 
         # Get active protocols via /devices/{id}/activity
