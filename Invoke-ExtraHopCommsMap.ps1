@@ -196,7 +196,7 @@ function Get-EHDeviceByIp {
     if (-not $result.Success) { return $result }
 
     $devices = $result.Data
-    if (-not $devices -or $devices.Count -eq 0) {
+    if (-not $devices -or ($devices | Measure-Object).Count -eq 0) {
         return @{ Success = $false; StatusCode = 404; Error = "No device found for IP $IpAddress" }
     }
 
@@ -226,7 +226,7 @@ function Get-EHDeviceByHostname {
     if (-not $result.Success) { return $result }
 
     $devices = $result.Data
-    if (-not $devices -or $devices.Count -eq 0) {
+    if (-not $devices -or ($devices | Measure-Object).Count -eq 0) {
         return @{ Success = $false; StatusCode = 404; Error = "No device found for hostname $Hostname" }
     }
 
@@ -517,7 +517,7 @@ function Invoke-EHDataCollection {
 
     $results = [System.Collections.ArrayList]::new()
     $warnings = [System.Collections.ArrayList]::new()
-    $total = $Devices.Count
+    $total = ($Devices | Measure-Object).Count
 
     for ($i = 0; $i -lt $total; $i++) {
         $device = $Devices[$i]
@@ -616,7 +616,7 @@ function Invoke-EHDataCollection {
                     $vals = $stat.values
                     # Each metric_spec produces one value per time bucket
                     # With 4 metric_specs, values array has 4 entries per stat
-                    if ($vals.Count -ge 4) {
+                    if (($vals | Measure-Object).Count -ge 4) {
                         $totalBytesIn += if ($vals[0]) { $vals[0] } else { 0 }
                         $totalBytesOut += if ($vals[1]) { $vals[1] } else { 0 }
                         $totalPktsIn += if ($vals[2]) { $vals[2] } else { 0 }
@@ -690,7 +690,7 @@ function Invoke-EHDataCollection {
 
             # Protocols from edge annotation or device-level fallback
             $peerProtos = $protoString
-            if ($peer.protocols -and $peer.protocols.Count -gt 0) {
+            if ($peer.protocols -and ($peer.protocols | Measure-Object).Count -gt 0) {
                 $peerProtos = ($peer.protocols | Sort-Object) -join ", "
             }
 
@@ -835,7 +835,8 @@ function Export-EHHtml {
         $tableRows = ""
         # Calculate top 10% threshold for high-traffic highlighting
         $allPeerBytes = $peerRows | ForEach-Object { [long]$_.bytes_in + [long]$_.bytes_out } | Sort-Object -Descending
-        $top10Threshold = if ($allPeerBytes.Count -gt 0) { $allPeerBytes[[math]::Max(0, [math]::Floor($allPeerBytes.Count * 0.1))] } else { [long]::MaxValue }
+        $peerByteCount = ($allPeerBytes | Measure-Object).Count
+        $top10Threshold = if ($peerByteCount -gt 0) { $allPeerBytes[[math]::Max(0, [math]::Floor($peerByteCount * 0.1))] } else { [long]::MaxValue }
 
         foreach ($row in $peerRows) {
             $rowTotal = [long]$row.bytes_in + [long]$row.bytes_out
@@ -910,7 +911,7 @@ $tableRows
 
     # Build warnings HTML
     $warningsHtml = ""
-    if ($Warnings.Count -gt 0) {
+    if (($Warnings | Measure-Object).Count -gt 0) {
         $warningRows = ""
         foreach ($w in $Warnings) {
             $warningRows += "<tr><td>$($w.Ip)</td><td>$($w.Hostname)</td><td><span class='badge badge-warning'>$($w.Reason)</span></td></tr>"
@@ -1246,7 +1247,7 @@ foreach ($row in $rawCsv) {
     }
 }
 
-if ($devices.Count -eq 0) {
+if (($devices | Measure-Object).Count -eq 0) {
     Write-Error "No valid devices found in input CSV. Ensure 'ip' and/or 'hostname' columns exist."
     exit 1
 }
@@ -1263,7 +1264,7 @@ if (-not $hasIpColumn -and -not $hasHostnameColumn) {
     exit 1
 }
 
-Write-Host "Found $($devices.Count) unique devices to query`n" -ForegroundColor Green
+Write-Host "Found $(($devices | Measure-Object).Count) unique devices to query`n" -ForegroundColor Green
 
 # Run data collection
 $collection = Invoke-EHDataCollection -Devices $devices.ToArray()
@@ -1280,9 +1281,9 @@ Export-EHHtml -Data $results -Warnings $warnings -OutputPath $htmlPath
 
 # Summary
 Write-Host "`n=== Summary ===" -ForegroundColor Cyan
-Write-Host "Devices queried: $($devices.Count)"
+Write-Host "Devices queried: $(($devices | Measure-Object).Count)"
 Write-Host "Peer relationships found: $(($results | Where-Object { $_.peer_ip -ne '' } | Measure-Object).Count)"
-Write-Host "Warnings: $($warnings.Count)"
+Write-Host "Warnings: $(($warnings | Measure-Object).Count)"
 Write-Host "CSV: $csvPath"
 Write-Host "HTML: $htmlPath"
 Write-Host ""
