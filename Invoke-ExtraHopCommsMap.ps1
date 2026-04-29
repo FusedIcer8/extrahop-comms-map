@@ -831,8 +831,10 @@ function Export-EHHtml {
     $deviceTypeOptions = ($allDeviceTypes | ForEach-Object { "<option value=`"$_`">$_</option>" }) -join "`n"
     $protocolOptions = ($allProtocols | ForEach-Object { "<option value=`"$_`">$_</option>" }) -join "`n"
 
-    # Build per-device card HTML
-    $cardsHtml = ""
+    # Build per-device card HTML using StringBuilder for performance
+    $cardsSb = New-Object System.Text.StringBuilder 65536
+    Write-Host "Generating HTML report..." -ForegroundColor Cyan
+
     foreach ($group in $grouped) {
         $sourceIp = $group.Name
         $rows = $group.Group
@@ -842,7 +844,7 @@ function Export-EHHtml {
         $cardBytes = ($rows | ForEach-Object { [long]$_.bytes_in + [long]$_.bytes_out } | Measure-Object -Sum).Sum
         $cardBytesFormatted = if ($cardBytes -ge 1GB) { "{0:N2} GB" -f ($cardBytes / 1GB) } elseif ($cardBytes -ge 1MB) { "{0:N2} MB" -f ($cardBytes / 1MB) } else { "{0:N0} B" -f $cardBytes }
 
-        $tableRows = ""
+        $rowsSb = New-Object System.Text.StringBuilder 4096
         # Calculate top 10% threshold for high-traffic highlighting
         $allPeerBytes = $peerRows | ForEach-Object { [long]$_.bytes_in + [long]$_.bytes_out } | Sort-Object -Descending
         $peerByteCount = ($allPeerBytes | Measure-Object).Count
@@ -863,78 +865,51 @@ function Export-EHHtml {
             $bytesInFmt = if ($row.bytes_in) { "{0:N0}" -f [long]$row.bytes_in } else { "0" }
             $bytesOutFmt = if ($row.bytes_out) { "{0:N0}" -f [long]$row.bytes_out } else { "0" }
 
-            $tableRows += @"
-<tr class="peer-row $borderClass" data-ip="$($row.peer_ip)" data-hostname="$($row.peer_hostname)" data-type="$($row.peer_extrahop_device_type)" data-role="$($row.peer_role)" data-direction="$($row.traffic_direction)" data-protocols="$($row.protocols)" data-ports="$($row.ports)">
-<td>$($row.peer_ip)</td>
-<td>$($row.peer_hostname)</td>
-<td><span class="badge badge-type">$($row.peer_extrahop_device_type)</span></td>
-<td>$($row.peer_role)</td>
-<td>$($row.traffic_direction)</td>
-<td>$($row.protocols)</td>
-<td>$($row.ports)</td>
-<td class="num">$bytesInFmt</td>
-<td class="num">$bytesOutFmt</td>
-<td>$($row.last_seen)</td>
-</tr>
-"@
+            [void]$rowsSb.AppendLine("<tr class=`"peer-row $borderClass`" data-ip=`"$($row.peer_ip)`" data-hostname=`"$($row.peer_hostname)`" data-type=`"$($row.peer_extrahop_device_type)`" data-role=`"$($row.peer_role)`" data-direction=`"$($row.traffic_direction)`" data-protocols=`"$($row.protocols)`" data-ports=`"$($row.ports)`">")
+            [void]$rowsSb.AppendLine("<td>$($row.peer_ip)</td><td>$($row.peer_hostname)</td>")
+            [void]$rowsSb.AppendLine("<td><span class=`"badge badge-type`">$($row.peer_extrahop_device_type)</span></td>")
+            [void]$rowsSb.AppendLine("<td>$($row.peer_role)</td><td>$($row.traffic_direction)</td>")
+            [void]$rowsSb.AppendLine("<td>$($row.protocols)</td><td>$($row.ports)</td>")
+            [void]$rowsSb.AppendLine("<td class=`"num`">$bytesInFmt</td><td class=`"num`">$bytesOutFmt</td>")
+            [void]$rowsSb.AppendLine("<td>$($row.last_seen)</td></tr>")
         }
 
-        $cardsHtml += @"
-<div class="device-card" data-source-ip="$sourceIp">
-<div class="card-header" onclick="toggleCard(this)">
-<div class="card-title">
-<span class="expand-icon">&#9654;</span>
-<strong>$sourceIp</strong>
-<span class="card-meta">$($firstRow.source_hostname)</span>
-<span class="card-meta">$($firstRow.source_description)</span>
-<span class="badge badge-type">$($firstRow.source_extrahop_device_type)</span>
-</div>
-<div class="card-stats">
-<span class="stat">$peerCount peers</span>
-<span class="stat">$cardBytesFormatted</span>
-</div>
-</div>
-<div class="card-body" style="display:none">
-<table class="peer-table">
-<thead>
-<tr>
-<th data-sort="ip">Peer IP</th>
-<th data-sort="hostname">Peer Hostname</th>
-<th data-sort="type">Device Type</th>
-<th data-sort="role">Role</th>
-<th data-sort="direction">Direction</th>
-<th data-sort="protocols">Protocols</th>
-<th data-sort="ports">Ports</th>
-<th data-sort="bytes_in" class="num">Bytes In</th>
-<th data-sort="bytes_out" class="num">Bytes Out</th>
-<th data-sort="last_seen">Last Seen</th>
-</tr>
-</thead>
-<tbody>
-$tableRows
-</tbody>
-</table>
-</div>
-</div>
-"@
+        $tableRows = $rowsSb.ToString()
+
+        [void]$cardsSb.AppendLine("<div class=`"device-card`" data-source-ip=`"$sourceIp`">")
+        [void]$cardsSb.AppendLine("<div class=`"card-header`" onclick=`"toggleCard(this)`">")
+        [void]$cardsSb.AppendLine("<div class=`"card-title`">")
+        [void]$cardsSb.AppendLine("<span class=`"expand-icon`">&#9654;</span>")
+        [void]$cardsSb.AppendLine("<strong>$sourceIp</strong>")
+        [void]$cardsSb.AppendLine("<span class=`"card-meta`">$($firstRow.source_hostname)</span>")
+        [void]$cardsSb.AppendLine("<span class=`"card-meta`">$($firstRow.source_description)</span>")
+        [void]$cardsSb.AppendLine("<span class=`"badge badge-type`">$($firstRow.source_extrahop_device_type)</span>")
+        [void]$cardsSb.AppendLine("</div><div class=`"card-stats`">")
+        [void]$cardsSb.AppendLine("<span class=`"stat`">$peerCount peers</span>")
+        [void]$cardsSb.AppendLine("<span class=`"stat`">$cardBytesFormatted</span>")
+        [void]$cardsSb.AppendLine("</div></div>")
+        [void]$cardsSb.AppendLine("<div class=`"card-body`" style=`"display:none`">")
+        [void]$cardsSb.AppendLine("<table class=`"peer-table`"><thead><tr>")
+        [void]$cardsSb.AppendLine("<th data-sort=`"ip`">Peer IP</th><th data-sort=`"hostname`">Peer Hostname</th>")
+        [void]$cardsSb.AppendLine("<th data-sort=`"type`">Device Type</th><th data-sort=`"role`">Role</th>")
+        [void]$cardsSb.AppendLine("<th data-sort=`"direction`">Direction</th><th data-sort=`"protocols`">Protocols</th>")
+        [void]$cardsSb.AppendLine("<th data-sort=`"ports`">Ports</th><th data-sort=`"bytes_in`" class=`"num`">Bytes In</th>")
+        [void]$cardsSb.AppendLine("<th data-sort=`"bytes_out`" class=`"num`">Bytes Out</th><th data-sort=`"last_seen`">Last Seen</th>")
+        [void]$cardsSb.AppendLine("</tr></thead><tbody>")
+        [void]$cardsSb.Append($tableRows)
+        [void]$cardsSb.AppendLine("</tbody></table></div></div>")
     }
+
+    $cardsHtml = $cardsSb.ToString()
 
     # Build warnings HTML
     $warningsHtml = ""
     if (($Warnings | Measure-Object).Count -gt 0) {
-        $warningRows = ""
+        $warnSb = New-Object System.Text.StringBuilder 2048
         foreach ($w in $Warnings) {
-            $warningRows += "<tr><td>$($w.Ip)</td><td>$($w.Hostname)</td><td><span class='badge badge-warning'>$($w.Reason)</span></td></tr>"
+            [void]$warnSb.AppendLine("<tr><td>$($w.Ip)</td><td>$($w.Hostname)</td><td><span class='badge badge-warning'>$($w.Reason)</span></td></tr>")
         }
-        $warningsHtml = @"
-<div class="warnings-section">
-<h2>Warnings</h2>
-<table class="warnings-table">
-<thead><tr><th>IP</th><th>Hostname</th><th>Reason</th></tr></thead>
-<tbody>$warningRows</tbody>
-</table>
-</div>
-"@
+        $warningsHtml = "<div class=`"warnings-section`"><h2>Warnings</h2><table class=`"warnings-table`"><thead><tr><th>IP</th><th>Hostname</th><th>Reason</th></tr></thead><tbody>$($warnSb.ToString())</tbody></table></div>"
     }
 
     # Full HTML document
