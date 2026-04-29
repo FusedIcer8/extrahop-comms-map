@@ -325,6 +325,9 @@ function Get-RecordField {
         Safely extracts a field value from a record object, trying multiple
         possible field names. Returns empty string if not found.
         Works with strict mode by using PSObject.Properties lookup.
+
+        ExtraHop IP address fields are objects like {type:"ipaddr4", value:"10.0.0.1"}
+        — this function unwraps them to return the plain IP string.
     #>
     [CmdletBinding()]
     param(
@@ -333,16 +336,34 @@ function Get-RecordField {
     )
 
     foreach ($name in $FieldNames) {
+        $val = $null
+
         # Check top-level property
         $prop = $Record.PSObject.Properties[$name]
-        if ($prop -and $null -ne $prop.Value) { return $prop.Value }
+        if ($prop -and $null -ne $prop.Value) { $val = $prop.Value }
 
         # Check _source wrapper
-        $sourceProp = $Record.PSObject.Properties["_source"]
-        if ($sourceProp -and $null -ne $sourceProp.Value) {
-            $innerProp = $sourceProp.Value.PSObject.Properties[$name]
-            if ($innerProp -and $null -ne $innerProp.Value) { return $innerProp.Value }
+        if ($null -eq $val) {
+            $sourceProp = $Record.PSObject.Properties["_source"]
+            if ($sourceProp -and $null -ne $sourceProp.Value) {
+                $innerProp = $sourceProp.Value.PSObject.Properties[$name]
+                if ($innerProp -and $null -ne $innerProp.Value) { $val = $innerProp.Value }
+            }
         }
+
+        if ($null -eq $val) { continue }
+
+        # Unwrap ExtraHop typed objects like {type:"ipaddr4", value:"10.0.0.1"}
+        if ($val -is [PSCustomObject] -or $val -is [System.Management.Automation.PSObject]) {
+            $valProp = $val.PSObject.Properties["value"]
+            if ($valProp -and $null -ne $valProp.Value) {
+                return $valProp.Value
+            }
+            # Fallback: return the object as string
+            return [string]$val
+        }
+
+        return $val
     }
     return ""
 }
@@ -411,8 +432,17 @@ function ConvertFrom-RecordSearch {
         $senderPort  = [string](Get-RecordField $rec @("senderPort", "sender.port", "sender_port"))
         $receiverPort = [string](Get-RecordField $rec @("receiverPort", "receiver.port", "receiver_port"))
 
-        # Extract protocol - also try the 'ex' object which may contain the record type
-        $proto = [string](Get-RecordField $rec @("proto", "protocol", "l7proto"))
+        # Extract protocol
+        $proto = [string](Get-RecordField $rec @("l7proto", "proto", "protocol"))
+        # If proto is just "TCP"/"UDP", try to get a more specific L7 protocol from the record type
+        if ($proto -eq "TCP" -or $proto -eq "UDP" -or -not $proto) {
+            $exType = [string](Get-RecordField $rec @("ex.type", "format", "_type"))
+            if ($exType -and $exType -ne "~flow") {
+                # Record types like "~ssl", "~http", "~dns" indicate the L7 protocol
+                $l7 = $exType -replace "^~", ""
+                if ($l7) { $proto = $l7.ToUpper() }
+            }
+        }
 
         # Extract bytes
         $bytesIn = [long]0; $bytesOut = [long]0
