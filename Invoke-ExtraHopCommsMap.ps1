@@ -279,7 +279,7 @@ function Get-EHDevicePeers {
         Returns an array of peer device objects with edge metadata.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][int]$DeviceId)
+    param([Parameter(Mandatory)][long]$DeviceId)
 
     $body = @{
         from             = -$script:LookbackMs
@@ -318,7 +318,7 @@ function Get-EHDeviceActivity {
         Returns stat_name values like "extrahop.device.http_client" indicating active protocols.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][int]$DeviceId)
+    param([Parameter(Mandatory)][long]$DeviceId)
 
     $endpoint = "/api/v1/devices/$DeviceId/activity"
     return Invoke-EHRequest -Endpoint $endpoint
@@ -330,7 +330,7 @@ function Get-EHDeviceById {
         Gets full device object by ExtraHop device ID.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][int]$DeviceId)
+    param([Parameter(Mandatory)][long]$DeviceId)
 
     $endpoint = "/api/v1/devices/$DeviceId"
     return Invoke-EHRequest -Endpoint $endpoint
@@ -344,7 +344,7 @@ function Get-EHDeviceMetrics {
         Time values are in milliseconds (negative = relative to now).
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][int]$DeviceId)
+    param([Parameter(Mandatory)][long]$DeviceId)
 
     $body = @{
         cycle           = "auto"
@@ -377,7 +377,7 @@ function ConvertFrom-ActivityMapResponse {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Response,
-        [Parameter(Mandatory)][int]$OriginDeviceId
+        [Parameter(Mandatory)][long]$OriginDeviceId
     )
 
     $peers = [System.Collections.ArrayList]::new()
@@ -1186,30 +1186,46 @@ foreach ($row in $rawCsv) {
         continue
     }
 
-    # Validate IP if present
-    if ($ip) {
-        # Skip CIDR notation
-        if ($ip -match "/\d+$") {
-            Write-Host "SKIP: CIDR notation not supported: $ip" -ForegroundColor Yellow
-            continue
-        }
-
-        # Skip invalid IPs
-        if ($ip -notmatch "^[\d.:a-fA-F]+$") {
-            Write-Host "SKIP: Invalid IP format: $ip" -ForegroundColor Yellow
-            continue
-        }
+    # Handle comma-separated IPs in a single field (e.g., "10.1.1.50, 10.1.1.51")
+    $ipList = @()
+    if ($ip -and $ip -match ",") {
+        $ipList = $ip -split "\s*,\s*" | Where-Object { $_ }
+    }
+    elseif ($ip) {
+        $ipList = @($ip)
+    }
+    else {
+        $ipList = @("")  # hostname-only entry
     }
 
-    # Deduplicate by IP (if present) or hostname
-    $dedupeKey = if ($ip) { $ip } else { $hostname.ToLower() }
-    if ($seenIps.ContainsKey($dedupeKey)) {
-        Write-Host "SKIP: Duplicate entry: $dedupeKey" -ForegroundColor Yellow
-        continue
-    }
-    $seenIps[$dedupeKey] = $true
+    foreach ($singleIp in $ipList) {
+        $currentIp = $singleIp.Trim()
 
-    [void]$devices.Add(@{ ip = $ip; hostname = $hostname; description = $description })
+        # Validate IP if present
+        if ($currentIp) {
+            # Skip CIDR notation
+            if ($currentIp -match "/\d+$") {
+                Write-Host "SKIP: CIDR notation not supported: $currentIp" -ForegroundColor Yellow
+                continue
+            }
+
+            # Skip invalid IPs
+            if ($currentIp -notmatch "^[\d.:a-fA-F]+$") {
+                Write-Host "SKIP: Invalid IP format: $currentIp" -ForegroundColor Yellow
+                continue
+            }
+        }
+
+        # Deduplicate by IP (if present) or hostname
+        $dedupeKey = if ($currentIp) { $currentIp } else { $hostname.ToLower() }
+        if ($seenIps.ContainsKey($dedupeKey)) {
+            Write-Host "SKIP: Duplicate entry: $dedupeKey" -ForegroundColor Yellow
+            continue
+        }
+        $seenIps[$dedupeKey] = $true
+
+        [void]$devices.Add(@{ ip = $currentIp; hostname = $hostname; description = $description })
+    }
 }
 
 if ($devices.Count -eq 0) {
