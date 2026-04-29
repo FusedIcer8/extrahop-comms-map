@@ -578,7 +578,25 @@ function Invoke-EHDataCollection {
         $peersResult = Get-EHDevicePeers -DeviceId $deviceId
         $peers = @()
         if ($peersResult.Success -and $peersResult.Data) {
+            # Diagnostic: dump first response to help debug response format
+            if ($i -eq 0 -or ($i -lt 3 -and $peersDumped -ne $true)) {
+                $script:peersDumped = $true
+                $dumpPath = Join-Path $script:Config.OutputDir "debug_activitymap_response.json"
+                try {
+                    $peersResult.Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $dumpPath -Encoding UTF8
+                    Write-Host "  DEBUG: activitymaps/query response dumped to $dumpPath" -ForegroundColor Magenta
+                }
+                catch {
+                    # Response might not be JSON-serializable (flat file content)
+                    $dumpPath = Join-Path $script:Config.OutputDir "debug_activitymap_response.txt"
+                    "$($peersResult.Data.GetType().FullName)`n---`n$($peersResult.Data)" | Out-File -FilePath $dumpPath -Encoding UTF8
+                    Write-Host "  DEBUG: raw response type=$($peersResult.Data.GetType().FullName) dumped to $dumpPath" -ForegroundColor Magenta
+                }
+            }
             $peers = ConvertFrom-ActivityMapResponse -Response $peersResult.Data -OriginDeviceId $deviceId
+        }
+        elseif (-not $peersResult.Success) {
+            Write-Verbose "  activitymaps/query failed: $($peersResult.Error)"
         }
 
         # Get active protocols via /devices/{id}/activity
