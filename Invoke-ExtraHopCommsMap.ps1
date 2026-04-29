@@ -552,6 +552,7 @@ function Invoke-EHDataCollection {
     $warnings = [System.Collections.ArrayList]::new()
     $total = ($Devices | Measure-Object).Count
     $peerDeviceCache = @{}  # Cache resolved peer device objects to avoid duplicate lookups
+    $script:detailDumped = $false
 
     for ($i = 0; $i -lt $total; $i++) {
         $device = $Devices[$i]
