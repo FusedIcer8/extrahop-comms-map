@@ -1464,12 +1464,12 @@ $collection = Invoke-EHDataCollection -Devices $devices.ToArray()
 $results = $collection.Results
 $warnings = $collection.Warnings
 
-# Export CSV
-$csvPath = Join-Path $script:Config.OutputDir "extrahop_comms_map.csv"
+# Export CSV and HTML with date suffix to avoid overwriting previous runs
+$dateSuffix = Get-Date -Format "yyyy-MM-dd_HHmmss"
+$csvPath = Join-Path $script:Config.OutputDir "extrahop_comms_map_$dateSuffix.csv"
 Export-EHCsv -Data $results -OutputPath $csvPath
 
-# Export HTML
-$htmlPath = Join-Path $script:Config.OutputDir "extrahop_comms_map.html"
+$htmlPath = Join-Path $script:Config.OutputDir "extrahop_comms_map_$dateSuffix.html"
 Export-EHHtml -Data $results -Warnings $warnings -OutputPath $htmlPath
 
 # Summary
