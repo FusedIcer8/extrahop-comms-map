@@ -272,43 +272,51 @@ function Resolve-EHDevice {
     return @{ Success = $false; StatusCode = 404; Error = "No device found for $identifier" }
 }
 
-function Get-EHDevicePeers {
+function Get-EHDevicePeerMetrics {
     <#
     .SYNOPSIS
-        Gets peer devices via POST /activitymaps/query (topology walk).
-        Returns an array of peer device objects with edge metadata.
+        Discovers peers via POST /metrics using detail metrics that break down
+        traffic by peer IP address. Tries multiple metric categories in order
+        of reliability: net_detail, tcp, net.
+        Returns the raw metrics response with per-peer key/value breakdowns.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][long]$DeviceId)
 
-    $body = @{
-        from             = -$script:LookbackMs
-        until            = 0
-        weighting        = "bytes"
-        edge_annotations = @("protocols", "appearances")
-        walks            = @(
-            @{
-                origins = @(
-                    @{
-                        object_type = "device"
-                        object_id   = $DeviceId
-                    }
-                )
-                steps   = @(
-                    @{
-                        relationships = @(
-                            @{
-                                role     = "any"
-                                protocol = ""
-                            }
-                        )
-                    }
-                )
+    # Try detail metric categories that break down by peer IP
+    $categories = @("net_detail", "tcp", "net")
+
+    foreach ($category in $categories) {
+        $body = @{
+            cycle           = "auto"
+            from            = -$script:LookbackMs
+            until           = 0
+            metric_category = $category
+            metric_specs    = @(
+                @{ name = "bytes_out" }
+            )
+            object_type     = "device"
+            object_ids      = @($DeviceId)
+        }
+
+        $result = Invoke-EHRequest -Endpoint "/api/v1/metrics" -Method "POST" -Body $body
+        if ($result.Success -and $result.Data -and $result.Data.stats) {
+            # Check if this response has detail (per-peer) data
+            # Detail metrics have values that are arrays of {key:{...}, value:N} objects
+            # Aggregate metrics have values that are simple numbers
+            $firstStat = $result.Data.stats | Select-Object -First 1
+            if ($firstStat -and $firstStat.values) {
+                $firstVal = $firstStat.values | Select-Object -First 1
+                # Detail metric: value is an object with .key property
+                if ($firstVal -and $firstVal.key) {
+                    Write-Verbose "  Peer detail found via metric_category=$category"
+                    return @{ Success = $true; Data = $result.Data; Category = $category; StatusCode = 200 }
+                }
             }
-        )
+        }
     }
 
-    return Invoke-EHRequest -Endpoint "/api/v1/activitymaps/query" -Method "POST" -Body $body
+    return @{ Success = $false; StatusCode = 404; Error = "No detail peer metrics found" }
 }
 
 function Get-EHDeviceActivity {
@@ -368,89 +376,53 @@ function Get-EHDeviceMetrics {
 
 #region ============ DATA COLLECTION ============
 
-function ConvertFrom-ActivityMapResponse {
+function ConvertFrom-DetailMetrics {
     <#
     .SYNOPSIS
-        Parses the POST /activitymaps/query response into a normalized peer list.
-        The response is a flat topology structure with nodes and edges.
+        Parses POST /metrics detail response into a list of peer IPs with byte counts.
+        Detail metrics return values as arrays of {key:{addr:"x.x.x.x"}, value:N} objects.
     #>
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][object]$Response,
-        [Parameter(Mandatory)][long]$OriginDeviceId
-    )
+    param([Parameter(Mandatory)][object]$MetricsData)
 
-    $peers = [System.Collections.ArrayList]::new()
+    $peerMap = @{}
 
-    # The activitymaps/query response contains edges and nodes
-    # Edges connect source device to peers with weight and optional protocol annotations
-    $edges = if ($Response.edges) { $Response.edges } else { @() }
-    $nodes = @{}
+    if (-not $MetricsData.stats) { return $peerMap }
 
-    # Build node lookup from response
-    if ($Response.nodes) {
-        foreach ($node in $Response.nodes) {
-            if ($node.id) {
-                $nodes[$node.id] = $node
+    foreach ($stat in $MetricsData.stats) {
+        if (-not $stat.values) { continue }
+        foreach ($entry in $stat.values) {
+            $peerAddr = $null
+            $bytes = 0
+
+            # Detail metric format: entry has .key and .value
+            if ($entry.key) {
+                # Key can be {addr:"x.x.x.x"} or {str:"hostname"} or just a string
+                if ($entry.key.addr) {
+                    $peerAddr = $entry.key.addr
+                }
+                elseif ($entry.key.str) {
+                    $peerAddr = $entry.key.str
+                }
+                elseif ($entry.key -is [string]) {
+                    $peerAddr = $entry.key
+                }
+
+                $bytes = if ($entry.value) { [long]$entry.value } else { 0 }
+            }
+
+            if ($peerAddr) {
+                if ($peerMap.ContainsKey($peerAddr)) {
+                    $peerMap[$peerAddr] += $bytes
+                }
+                else {
+                    $peerMap[$peerAddr] = $bytes
+                }
             }
         }
     }
 
-    foreach ($edge in $edges) {
-        # Determine which end is the peer (not our origin device)
-        $peerId = $null
-        $role = "any"
-
-        if ($edge.from -eq $OriginDeviceId) {
-            $peerId = $edge.to
-            $role = "server"  # origin is client, peer is server
-        }
-        elseif ($edge.to -eq $OriginDeviceId) {
-            $peerId = $edge.from
-            $role = "client"  # origin is server, peer is client
-        }
-        else {
-            continue
-        }
-
-        if (-not $peerId) { continue }
-
-        # Get peer node metadata
-        $peerNode = if ($nodes.ContainsKey($peerId)) { $nodes[$peerId] } else { $null }
-
-        # Extract protocol annotations from edge
-        $edgeProtocols = @()
-        if ($edge.annotations -and $edge.annotations.protocols) {
-            $edgeProtocols = $edge.annotations.protocols
-        }
-        elseif ($edge.protocols) {
-            $edgeProtocols = $edge.protocols
-        }
-
-        # Extract weight (bytes)
-        $weight = if ($edge.weight) { [long]$edge.weight } else { 0 }
-
-        # Extract appearances (first/last seen)
-        $firstSeen = ""
-        $lastSeen = ""
-        if ($edge.annotations -and $edge.annotations.appearances) {
-            $appearances = $edge.annotations.appearances
-            if ($appearances.from) { $firstSeen = $appearances.from }
-            if ($appearances.until) { $lastSeen = $appearances.until }
-        }
-
-        [void]$peers.Add(@{
-            id         = $peerId
-            node       = $peerNode
-            role       = $role
-            protocols  = $edgeProtocols
-            weight     = $weight
-            first_seen = $firstSeen
-            last_seen  = $lastSeen
-        })
-    }
-
-    return $peers
+    return $peerMap
 }
 
 function ConvertFrom-DeviceActivity {
@@ -506,9 +478,9 @@ function Invoke-EHDataCollection {
     <#
     .SYNOPSIS
         Main data collection loop — queries ExtraHop for each input device.
-        Uses POST /activitymaps/query for peer discovery,
+        Uses POST /metrics with detail metrics for peer discovery (per-peer IP breakdown),
         GET /devices/{id}/activity for protocol detection,
-        and POST /metrics for traffic volume.
+        and POST /metrics with aggregate metrics for total traffic volume.
     #>
     [CmdletBinding()]
     param(
@@ -518,6 +490,7 @@ function Invoke-EHDataCollection {
     $results = [System.Collections.ArrayList]::new()
     $warnings = [System.Collections.ArrayList]::new()
     $total = ($Devices | Measure-Object).Count
+    $peerDeviceCache = @{}  # Cache resolved peer device objects to avoid duplicate lookups
 
     for ($i = 0; $i -lt $total; $i++) {
         $device = $Devices[$i]
@@ -541,7 +514,6 @@ function Invoke-EHDataCollection {
                 [void]$warnings.Add(@{ Ip = $ip; Hostname = $hostname; Reason = "API error: $($resolved.Error)" })
             }
 
-            # Emit empty row for devices not found
             [void]$results.Add([PSCustomObject]@{
                 source_ip                    = $ip
                 source_hostname              = $hostname
@@ -574,29 +546,26 @@ function Invoke-EHDataCollection {
         # If resolved by hostname and we didn't have an IP, populate from ExtraHop
         if (-not $ip -and $ehDevice.ipaddr4) { $ip = $ehDevice.ipaddr4 }
 
-        # Get peer topology via activitymaps/query
-        $peersResult = Get-EHDevicePeers -DeviceId $deviceId
-        $peers = @()
-        if ($peersResult.Success -and $peersResult.Data) {
-            # Diagnostic: dump first response to help debug response format
-            if ($i -eq 0 -or ($i -lt 3 -and $peersDumped -ne $true)) {
-                $script:peersDumped = $true
-                $dumpPath = Join-Path $script:Config.OutputDir "debug_activitymap_response.json"
+        # === PEER DISCOVERY via detail metrics ===
+        # Detail metrics break down traffic by peer IP in the key field
+        $peerResult = Get-EHDevicePeerMetrics -DeviceId $deviceId
+        $peerMap = @{}
+        if ($peerResult.Success -and $peerResult.Data) {
+            # Diagnostic: dump first successful detail response
+            if ($i -lt 3 -and -not $script:detailDumped) {
+                $script:detailDumped = $true
+                $dumpPath = Join-Path $script:Config.OutputDir "debug_detail_metrics.json"
                 try {
-                    $peersResult.Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $dumpPath -Encoding UTF8
-                    Write-Host "  DEBUG: activitymaps/query response dumped to $dumpPath" -ForegroundColor Magenta
+                    $peerResult.Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $dumpPath -Encoding UTF8
+                    Write-Host "  DEBUG: detail metrics (category=$($peerResult.Category)) dumped to $dumpPath" -ForegroundColor Magenta
                 }
                 catch {
-                    # Response might not be JSON-serializable (flat file content)
-                    $dumpPath = Join-Path $script:Config.OutputDir "debug_activitymap_response.txt"
-                    "$($peersResult.Data.GetType().FullName)`n---`n$($peersResult.Data)" | Out-File -FilePath $dumpPath -Encoding UTF8
-                    Write-Host "  DEBUG: raw response type=$($peersResult.Data.GetType().FullName) dumped to $dumpPath" -ForegroundColor Magenta
+                    $dumpPath = Join-Path $script:Config.OutputDir "debug_detail_metrics.txt"
+                    "$($peerResult.Data.GetType().FullName)`n---`n$($peerResult.Data)" | Out-File -FilePath $dumpPath -Encoding UTF8
+                    Write-Host "  DEBUG: raw response dumped to $dumpPath" -ForegroundColor Magenta
                 }
             }
-            $peers = ConvertFrom-ActivityMapResponse -Response $peersResult.Data -OriginDeviceId $deviceId
-        }
-        elseif (-not $peersResult.Success) {
-            Write-Verbose "  activitymaps/query failed: $($peersResult.Error)"
+            $peerMap = ConvertFrom-DetailMetrics -MetricsData $peerResult.Data
         }
 
         # Get active protocols via /devices/{id}/activity
@@ -607,15 +576,13 @@ function Invoke-EHDataCollection {
         }
         $protoString = ($deviceProtocols | Sort-Object) -join ", "
 
-        # Get aggregate metrics via POST /metrics (time in milliseconds)
+        # Get aggregate metrics via POST /metrics
         $metricsResult = Get-EHDeviceMetrics -DeviceId $deviceId
         $totalBytesIn = 0; $totalBytesOut = 0; $totalPktsIn = 0; $totalPktsOut = 0
         if ($metricsResult.Success -and $metricsResult.Data -and $metricsResult.Data.stats) {
             foreach ($stat in $metricsResult.Data.stats) {
                 if ($stat.values) {
                     $vals = $stat.values
-                    # Each metric_spec produces one value per time bucket
-                    # With 4 metric_specs, values array has 4 entries per stat
                     if (($vals | Measure-Object).Count -ge 4) {
                         $totalBytesIn += if ($vals[0]) { $vals[0] } else { 0 }
                         $totalBytesOut += if ($vals[1]) { $vals[1] } else { 0 }
@@ -626,7 +593,7 @@ function Invoke-EHDataCollection {
             }
         }
 
-        $peerCount = ($peers | Measure-Object).Count
+        $peerCount = ($peerMap.Keys | Measure-Object).Count
         Write-Host "$prefix $displayIdentifier... " -NoNewline
         Write-Host "found (id=$deviceId) -> $peerCount peers" -ForegroundColor Green
 
@@ -643,7 +610,7 @@ function Invoke-EHDataCollection {
                 peer_extrahop_device_type    = ""
                 peer_role                    = ""
                 traffic_direction            = ""
-                protocols                    = ""
+                protocols                    = $protoString
                 ports                        = ""
                 bytes_in                     = $totalBytesIn
                 bytes_out                    = $totalBytesOut
@@ -655,63 +622,39 @@ function Invoke-EHDataCollection {
             continue
         }
 
-        # Process each peer from the topology response
-        foreach ($peer in $peers) {
-            $peerDeviceId = $peer.id
-            $peerNode = $peer.node
+        # Process each peer from the detail metrics
+        foreach ($peerAddr in $peerMap.Keys) {
+            $peerBytesOut = $peerMap[$peerAddr]
 
-            # Extract peer device info from node metadata or fetch it
-            $peerIp = ""; $peerHostname = ""; $peerDisplayName = ""; $peerDeviceType = ""
-            if ($peerNode) {
-                $peerIp = if ($peerNode.ipaddr4) { $peerNode.ipaddr4 } elseif ($peerNode.ipaddr6) { $peerNode.ipaddr6 } else { "" }
-                $peerHostname = if ($peerNode.dns_name) { $peerNode.dns_name } else { "" }
-                $peerDisplayName = if ($peerNode.display_name) { $peerNode.display_name } else { "" }
-                $peerDeviceType = if ($peerNode.device_class) { $peerNode.device_class } else { "" }
+            # Try to resolve peer IP to a device in ExtraHop (with caching)
+            $peerHostname = ""; $peerDisplayName = ""; $peerDeviceType = ""
+            if ($peerDeviceCache.ContainsKey($peerAddr)) {
+                $cached = $peerDeviceCache[$peerAddr]
+                $peerHostname = $cached.hostname
+                $peerDisplayName = $cached.display_name
+                $peerDeviceType = $cached.device_class
             }
             else {
-                # Node not in topology response — fetch device details
-                $peerDetail = Get-EHDeviceById -DeviceId $peerDeviceId
-                if ($peerDetail.Success -and $peerDetail.Data) {
-                    $pd = $peerDetail.Data
-                    $peerIp = if ($pd.ipaddr4) { $pd.ipaddr4 } elseif ($pd.ipaddr6) { $pd.ipaddr6 } else { "" }
-                    $peerHostname = if ($pd.dns_name) { $pd.dns_name } else { "" }
-                    $peerDisplayName = if ($pd.display_name) { $pd.display_name } else { "" }
-                    $peerDeviceType = if ($pd.device_class) { $pd.device_class } else { "" }
+                # Only resolve if it looks like an IP address
+                if ($peerAddr -match "^[\d.]+$" -or $peerAddr -match ":") {
+                    $peerResolved = Get-EHDeviceByIp -IpAddress $peerAddr
+                    if ($peerResolved.Success -and $peerResolved.Data) {
+                        $pd = $peerResolved.Data
+                        $peerHostname = if ($pd.dns_name) { $pd.dns_name } else { "" }
+                        $peerDisplayName = if ($pd.display_name) { $pd.display_name } else { "" }
+                        $peerDeviceType = if ($pd.device_class) { $pd.device_class } else { "" }
+                    }
+                    $peerDeviceCache[$peerAddr] = @{
+                        hostname     = $peerHostname
+                        display_name = $peerDisplayName
+                        device_class = $peerDeviceType
+                    }
                 }
             }
 
-            # Determine role and direction
-            $peerRole = $peer.role
-            $direction = switch ($peerRole) {
-                "client"  { "inbound" }
-                "server"  { "outbound" }
-                default   { "bidirectional" }
-            }
-
-            # Protocols from edge annotation or device-level fallback
-            $peerProtos = $protoString
-            if ($peer.protocols -and ($peer.protocols | Measure-Object).Count -gt 0) {
-                $peerProtos = ($peer.protocols | Sort-Object) -join ", "
-            }
-
-            # Ports — not directly available from activitymaps/query; leave as protocol-inferred
-            $peerPorts = ""
-
-            # Per-peer bytes from edge weight (total bytes for this connection)
-            # Weight from activitymaps is total bytes; split estimate for in/out
-            $edgeBytes = $peer.weight
-            $peerBytesIn = [math]::Floor($edgeBytes / 2)
-            $peerBytesOut = $edgeBytes - $peerBytesIn
-            $peerPktsIn = 0
-            $peerPktsOut = 0
-
-            $firstSeen = $peer.first_seen
-            $lastSeen = $peer.last_seen
-
-            # If peer has no IP, use display name as fallback
-            if (-not $peerIp -and $peerDisplayName) {
-                $peerIp = $peerDisplayName
-            }
+            # Direction: we queried bytes_out from source, so these are outbound peers
+            $direction = "outbound"
+            $peerRole = "server"
 
             [void]$results.Add([PSCustomObject]@{
                 source_ip                    = $ip
@@ -719,20 +662,20 @@ function Invoke-EHDataCollection {
                 source_description           = $description
                 source_extrahop_display_name = $displayName
                 source_extrahop_device_type  = $deviceType
-                peer_ip                      = $peerIp
+                peer_ip                      = $peerAddr
                 peer_hostname                = $peerHostname
                 peer_extrahop_display_name   = $peerDisplayName
                 peer_extrahop_device_type    = $peerDeviceType
                 peer_role                    = $peerRole
                 traffic_direction            = $direction
-                protocols                    = $peerProtos
-                ports                        = $peerPorts
-                bytes_in                     = $peerBytesIn
+                protocols                    = $protoString
+                ports                        = ""
+                bytes_in                     = 0
                 bytes_out                    = $peerBytesOut
-                pkts_in                      = $peerPktsIn
-                pkts_out                     = $peerPktsOut
-                first_seen                   = $firstSeen
-                last_seen                    = $lastSeen
+                pkts_in                      = 0
+                pkts_out                     = 0
+                first_seen                   = ""
+                last_seen                    = ""
             })
         }
     }
