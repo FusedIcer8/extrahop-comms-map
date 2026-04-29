@@ -360,6 +360,8 @@ function ConvertFrom-RecordSearch {
     )
 
     $peerMap = @{}
+    $debugCounter = 0
+    $skippedRecords = 0
 
     $records = if ($RecordsData.PSObject.Properties["records"] -and $RecordsData.records) {
         $RecordsData.records
@@ -367,35 +369,50 @@ function ConvertFrom-RecordSearch {
         $RecordsData
     } else { @() }
 
-    # Diagnostic: dump field names from first record
-    if (($records | Measure-Object).Count -gt 0) {
+    $recordCount = ($records | Measure-Object).Count
+
+    # Diagnostic: dump field names and sample values from first record
+    if ($recordCount -gt 0) {
         $firstRec = $records | Select-Object -First 1
         $fieldNames = $firstRec.PSObject.Properties | ForEach-Object { $_.Name }
+        Write-Host "  Records returned: $recordCount" -ForegroundColor DarkGray
         Write-Host "  Record fields: $($fieldNames -join ', ')" -ForegroundColor DarkGray
 
-        # If _source exists, show its fields too
+        # If _source exists, show its fields and sample values
         $srcProp = $firstRec.PSObject.Properties["_source"]
         if ($srcProp -and $null -ne $srcProp.Value) {
-            $srcFields = $srcProp.Value.PSObject.Properties | ForEach-Object { $_.Name }
+            $src = $srcProp.Value
+            $srcFields = $src.PSObject.Properties | ForEach-Object { $_.Name }
             Write-Host "  _source fields: $($srcFields -join ', ')" -ForegroundColor DarkGray
+
+            # Show sample values for key fields
+            foreach ($fn in @("clientAddr", "serverAddr", "clientPort", "serverPort", "clientBytes", "serverBytes", "proto", "protocol")) {
+                $fp = $src.PSObject.Properties[$fn]
+                if ($fp -and $null -ne $fp.Value) {
+                    $val = $fp.Value
+                    $valType = $val.GetType().Name
+                    Write-Host "  _source.$fn = '$val' (type: $valType)" -ForegroundColor DarkGray
+                }
+            }
         }
+        Write-Host "  Searching for DeviceIp: '$DeviceIp'" -ForegroundColor DarkGray
     }
 
     foreach ($rec in $records) {
         # Extract addresses - try all known naming patterns
-        $clientAddr  = Get-RecordField $rec @("clientAddr", "client.addr", "client_addr", "src", "srcAddr", "source", "sourceAddr")
-        $serverAddr  = Get-RecordField $rec @("serverAddr", "server.addr", "server_addr", "dst", "dstAddr", "destination", "destAddr")
-        $senderAddr  = Get-RecordField $rec @("senderAddr", "sender.addr", "sender_addr")
-        $receiverAddr = Get-RecordField $rec @("receiverAddr", "receiver.addr", "receiver_addr")
+        $clientAddr  = [string](Get-RecordField $rec @("clientAddr", "client.addr", "client_addr", "src", "srcAddr", "source", "sourceAddr"))
+        $serverAddr  = [string](Get-RecordField $rec @("serverAddr", "server.addr", "server_addr", "dst", "dstAddr", "destination", "destAddr"))
+        $senderAddr  = [string](Get-RecordField $rec @("senderAddr", "sender.addr", "sender_addr"))
+        $receiverAddr = [string](Get-RecordField $rec @("receiverAddr", "receiver.addr", "receiver_addr"))
 
         # Extract ports
-        $clientPort  = Get-RecordField $rec @("clientPort", "client.port", "client_port", "srcPort", "src_port", "sourcePort")
-        $serverPort  = Get-RecordField $rec @("serverPort", "server.port", "server_port", "dstPort", "dst_port", "destPort", "port")
-        $senderPort  = Get-RecordField $rec @("senderPort", "sender.port", "sender_port")
-        $receiverPort = Get-RecordField $rec @("receiverPort", "receiver.port", "receiver_port")
+        $clientPort  = [string](Get-RecordField $rec @("clientPort", "client.port", "client_port", "srcPort", "src_port", "sourcePort"))
+        $serverPort  = [string](Get-RecordField $rec @("serverPort", "server.port", "server_port", "dstPort", "dst_port", "destPort", "port"))
+        $senderPort  = [string](Get-RecordField $rec @("senderPort", "sender.port", "sender_port"))
+        $receiverPort = [string](Get-RecordField $rec @("receiverPort", "receiver.port", "receiver_port"))
 
-        # Extract protocol
-        $proto = Get-RecordField $rec @("proto", "protocol", "l7proto", "ex.type", "type")
+        # Extract protocol - also try the 'ex' object which may contain the record type
+        $proto = [string](Get-RecordField $rec @("proto", "protocol", "l7proto"))
 
         # Extract bytes
         $bytesIn = [long]0; $bytesOut = [long]0
@@ -418,22 +435,28 @@ function ConvertFrom-RecordSearch {
         # Determine peer and direction
         $peerIp = ""; $peerPort = ""; $role = ""; $direction = ""
 
-        if ($clientAddr -eq $DeviceIp -and $serverAddr) {
+        # Debug first record's comparison values
+        if ($debugCounter -lt 3) {
+            $debugCounter++
+            Write-Host "  DEBUG rec[$debugCounter]: clientAddr='$clientAddr' serverAddr='$serverAddr' DeviceIp='$DeviceIp' match_client=$($clientAddr -eq $DeviceIp) match_server=$($serverAddr -eq $DeviceIp)" -ForegroundColor Magenta
+        }
+
+        if ($clientAddr -and $clientAddr -eq $DeviceIp -and $serverAddr) {
             $peerIp = $serverAddr; $peerPort = $serverPort; $role = "server"; $direction = "outbound"
         }
-        elseif ($serverAddr -eq $DeviceIp -and $clientAddr) {
+        elseif ($serverAddr -and $serverAddr -eq $DeviceIp -and $clientAddr) {
             $peerIp = $clientAddr; $peerPort = $clientPort; $role = "client"; $direction = "inbound"
             $tmp = $bytesIn; $bytesIn = $bytesOut; $bytesOut = $tmp
         }
-        elseif ($senderAddr -eq $DeviceIp -and $receiverAddr) {
+        elseif ($senderAddr -and $senderAddr -eq $DeviceIp -and $receiverAddr) {
             $peerIp = $receiverAddr; $peerPort = $receiverPort; $role = "server"; $direction = "outbound"
         }
-        elseif ($receiverAddr -eq $DeviceIp -and $senderAddr) {
+        elseif ($receiverAddr -and $receiverAddr -eq $DeviceIp -and $senderAddr) {
             $peerIp = $senderAddr; $peerPort = $senderPort; $role = "client"; $direction = "inbound"
             $tmp = $bytesIn; $bytesIn = $bytesOut; $bytesOut = $tmp
         }
 
-        if (-not $peerIp) { continue }
+        if (-not $peerIp) { $skippedRecords++; continue }
 
         if (-not $peerMap.ContainsKey($peerIp)) {
             $peerMap[$peerIp] = @{
@@ -455,6 +478,11 @@ function ConvertFrom-RecordSearch {
             $peer.direction = "bidirectional"
             $peer.role = "any"
         }
+    }
+
+    $matchedRecords = $recordCount - $skippedRecords
+    if ($recordCount -gt 0) {
+        Write-Host "  Records: $recordCount total, $matchedRecords matched, $skippedRecords skipped, $($peerMap.Keys.Count) unique peers" -ForegroundColor DarkGray
     }
 
     return $peerMap
