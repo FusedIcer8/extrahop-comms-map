@@ -1071,7 +1071,7 @@ function Export-EHHtml {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][System.Collections.ArrayList]$Data,
-        [Parameter(Mandatory)][System.Collections.ArrayList]$Warnings,
+        [Parameter()][AllowEmptyCollection()][System.Collections.ArrayList]$Warnings = @(),
         [Parameter(Mandatory)][string]$OutputPath
     )
 
