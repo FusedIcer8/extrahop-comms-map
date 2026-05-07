@@ -368,10 +368,57 @@ function Get-RecordField {
     return ""
 }
 
+function Resolve-PortProtocol {
+    <#
+    .SYNOPSIS
+        Maps a port number to a well-known protocol name.
+        Used as fallback when ExtraHop doesn't detect L7 protocol.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()][string]$Port,
+        [Parameter()][string]$DetectedProto
+    )
+
+    # If ExtraHop already detected a specific L7 protocol, use it
+    if ($DetectedProto -and $DetectedProto -ne "TCP" -and $DetectedProto -ne "UDP") {
+        return $DetectedProto
+    }
+
+    # Well-known port-to-protocol mapping
+    $portMap = @{
+        "20" = "FTP-DATA"; "21" = "FTP"; "22" = "SSH"; "23" = "TELNET"
+        "25" = "SMTP"; "53" = "DNS"; "67" = "DHCP"; "68" = "DHCP"
+        "69" = "TFTP"; "80" = "HTTP"; "88" = "KERBEROS"; "110" = "POP3"
+        "111" = "RPC"; "123" = "NTP"; "135" = "RPC-EPMAP"; "137" = "NETBIOS"
+        "138" = "NETBIOS"; "139" = "NETBIOS"; "143" = "IMAP"; "161" = "SNMP"
+        "162" = "SNMP-TRAP"; "389" = "LDAP"; "443" = "HTTPS"; "445" = "SMB"
+        "464" = "KPASSWD"; "465" = "SMTPS"; "514" = "SYSLOG"; "515" = "LPD"
+        "587" = "SMTP"; "593" = "RPC-HTTP"; "636" = "LDAPS"; "993" = "IMAPS"
+        "995" = "POP3S"; "1433" = "MSSQL"; "1434" = "MSSQL-BROWSER"
+        "1521" = "ORACLE"; "2049" = "NFS"; "2181" = "ZOOKEEPER"
+        "2375" = "DOCKER"; "2376" = "DOCKER-TLS"; "3268" = "LDAP-GC"
+        "3269" = "LDAPS-GC"; "3306" = "MYSQL"; "3389" = "RDP"
+        "4443" = "HTTPS-ALT"; "5432" = "POSTGRESQL"; "5672" = "AMQP"
+        "5985" = "WINRM-HTTP"; "5986" = "WINRM-HTTPS"; "6379" = "REDIS"
+        "8080" = "HTTP-PROXY"; "8443" = "HTTPS-ALT"; "8888" = "HTTP-ALT"
+        "9090" = "PROMETHEUS"; "9200" = "ELASTICSEARCH"; "9443" = "HTTPS-ALT"
+        "27017" = "MONGODB"
+    }
+
+    if ($Port -and $portMap.ContainsKey($Port)) {
+        return $portMap[$Port]
+    }
+
+    # Return whatever we have (TCP/UDP or empty)
+    return $DetectedProto
+}
+
 function ConvertFrom-RecordSearch {
     <#
     .SYNOPSIS
         Parses POST /records/search response into a peer map with IP, port, protocol, and bytes.
+        Tracks port/protocol pairs so each connection shows the service (e.g., 443/HTTPS).
         Uses safe property access to handle any field naming convention ExtraHop uses.
     #>
     [CmdletBinding()]
@@ -490,18 +537,31 @@ function ConvertFrom-RecordSearch {
 
         if (-not $peerMap.ContainsKey($peerIp)) {
             $peerMap[$peerIp] = @{
-                ports     = [System.Collections.Generic.HashSet[string]]::new()
-                protocols = [System.Collections.Generic.HashSet[string]]::new()
-                bytes_in  = [long]0
-                bytes_out = [long]0
-                role      = $role
-                direction = $direction
+                port_protocols = @{}             # port -> best known protocol name
+                ports          = [System.Collections.Generic.HashSet[string]]::new()
+                protocols      = [System.Collections.Generic.HashSet[string]]::new()
+                bytes_in       = [long]0
+                bytes_out      = [long]0
+                role           = $role
+                direction      = $direction
             }
         }
 
         $peer = $peerMap[$peerIp]
-        if ($peerPort) { [void]$peer.ports.Add([string]$peerPort) }
-        if ($proto) { [void]$peer.protocols.Add([string]$proto) }
+
+        # Resolve the best protocol name for this port (L7 detected > well-known port > TCP/UDP)
+        $resolvedProto = Resolve-PortProtocol -Port $peerPort -DetectedProto $proto
+
+        if ($peerPort) {
+            [void]$peer.ports.Add([string]$peerPort)
+            # Keep the most specific protocol per port (prefer L7-detected over port-mapped)
+            $existing = $null
+            if ($peer.port_protocols.ContainsKey($peerPort)) { $existing = $peer.port_protocols[$peerPort] }
+            if (-not $existing -or $existing -eq "TCP" -or $existing -eq "UDP") {
+                if ($resolvedProto) { $peer.port_protocols[$peerPort] = $resolvedProto }
+            }
+        }
+        if ($resolvedProto) { [void]$peer.protocols.Add([string]$resolvedProto) }
         $peer.bytes_in += $bytesIn
         $peer.bytes_out += $bytesOut
         if ($peer.direction -ne $direction -and $peer.direction -ne "bidirectional") {
@@ -787,6 +847,7 @@ function Invoke-EHDataCollection {
                 peer_extrahop_device_type    = ""
                 peer_role                    = ""
                 traffic_direction            = ""
+                services                     = ""
                 protocols                    = ""
                 ports                        = ""
                 bytes_in                     = ""
@@ -884,6 +945,7 @@ function Invoke-EHDataCollection {
                 peer_extrahop_device_type    = ""
                 peer_role                    = ""
                 traffic_direction            = ""
+                services                     = ""
                 protocols                    = $protoString
                 ports                        = ""
                 bytes_in                     = $totalBytesIn
@@ -926,8 +988,21 @@ function Invoke-EHDataCollection {
                 }
             }
 
-            # Ports and protocols from record data
-            $peerPorts = ($peerData.ports | Sort-Object { try { [int]$_ } catch { $_ } }) -join ", "
+            # Build port/protocol service pairs (e.g., "443/HTTPS, 22/SSH, 80/HTTP")
+            $sortedPorts = $peerData.ports | Sort-Object { try { [int]$_ } catch { $_ } }
+            $servicePairs = @()
+            foreach ($p in $sortedPorts) {
+                $mappedProto = if ($peerData.port_protocols.ContainsKey($p)) { $peerData.port_protocols[$p] } else { "" }
+                if ($mappedProto) {
+                    $servicePairs += "$p/$mappedProto"
+                } else {
+                    $servicePairs += $p
+                }
+            }
+            $servicesString = $servicePairs -join ", "
+
+            # Keep separate ports and protocols for backwards compatibility / filtering
+            $peerPorts = ($sortedPorts) -join ", "
             $peerProtos = ($peerData.protocols | Sort-Object) -join ", "
             if (-not $peerProtos) { $peerProtos = $protoString }
 
@@ -943,6 +1018,7 @@ function Invoke-EHDataCollection {
                 peer_extrahop_device_type    = $peerDeviceType
                 peer_role                    = $peerData.role
                 traffic_direction            = $peerData.direction
+                services                     = $servicesString
                 protocols                    = $peerProtos
                 ports                        = $peerPorts
                 bytes_in                     = $peerData.bytes_in
@@ -980,7 +1056,7 @@ function Export-EHCsv {
 
     $sorted | Select-Object source_ip, source_hostname, source_description, source_extrahop_display_name,
         source_extrahop_device_type, peer_ip, peer_hostname, peer_extrahop_display_name,
-        peer_extrahop_device_type, peer_role, traffic_direction, protocols, ports,
+        peer_extrahop_device_type, peer_role, traffic_direction, services, protocols, ports,
         bytes_in, bytes_out, pkts_in, pkts_out, first_seen, last_seen |
         Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
 
@@ -1005,13 +1081,18 @@ function Export-EHHtml {
     # Compute summary stats
     $sourceDevices = ($Data | Select-Object -Property source_ip -Unique | Measure-Object).Count
     $uniquePeers = ($Data | Where-Object { $_.peer_ip -ne "" } | Select-Object -Property peer_ip -Unique | Measure-Object).Count
+    $allServices = @()
     $allPorts = @()
     foreach ($row in $Data) {
+        if ($row.services) {
+            $allServices += ($row.services -split ",\s*")
+        }
         if ($row.ports) {
             $allPorts += ($row.ports -split ",\s*")
         }
     }
     $uniquePorts = ($allPorts | Select-Object -Unique | Measure-Object).Count
+    $uniqueServices = ($allServices | Where-Object { $_ } | Select-Object -Unique | Measure-Object).Count
     $totalBytes = ($Data | ForEach-Object { [long]$_.bytes_in + [long]$_.bytes_out } | Measure-Object -Sum).Sum
     $totalBytesFormatted = if ($totalBytes -ge 1GB) { "{0:N2} GB" -f ($totalBytes / 1GB) } elseif ($totalBytes -ge 1MB) { "{0:N2} MB" -f ($totalBytes / 1MB) } else { "{0:N0} bytes" -f $totalBytes }
     $notFoundCount = ($Warnings | Measure-Object).Count
@@ -1077,7 +1158,7 @@ function Export-EHHtml {
             [void]$rowsSb.AppendLine("<td>$($row.peer_ip)</td><td>$($row.peer_hostname)</td>")
             [void]$rowsSb.AppendLine("<td><span class=`"badge badge-type`">$($row.peer_extrahop_device_type)</span></td>")
             [void]$rowsSb.AppendLine("<td>$($row.peer_role)</td><td>$($row.traffic_direction)</td>")
-            [void]$rowsSb.AppendLine("<td>$($row.protocols)</td><td>$($row.ports)</td>")
+            [void]$rowsSb.AppendLine("<td>$($row.services)</td>")
             [void]$rowsSb.AppendLine("<td class=`"num`">$bytesInFmt</td><td class=`"num`">$bytesOutFmt</td>")
             [void]$rowsSb.AppendLine("<td>$($row.last_seen)</td></tr>")
         }
@@ -1100,8 +1181,8 @@ function Export-EHHtml {
         [void]$cardsSb.AppendLine("<table class=`"peer-table`"><thead><tr>")
         [void]$cardsSb.AppendLine("<th data-sort=`"ip`">Peer IP</th><th data-sort=`"hostname`">Peer Hostname</th>")
         [void]$cardsSb.AppendLine("<th data-sort=`"type`">Device Type</th><th data-sort=`"role`">Role</th>")
-        [void]$cardsSb.AppendLine("<th data-sort=`"direction`">Direction</th><th data-sort=`"protocols`">Protocols</th>")
-        [void]$cardsSb.AppendLine("<th data-sort=`"ports`">Ports</th><th data-sort=`"bytes_in`" class=`"num`">Bytes In</th>")
+        [void]$cardsSb.AppendLine("<th data-sort=`"direction`">Direction</th><th data-sort=`"services`">Services (Port/Protocol)</th>")
+        [void]$cardsSb.AppendLine("<th data-sort=`"bytes_in`" class=`"num`">Bytes In</th>")
         [void]$cardsSb.AppendLine("<th data-sort=`"bytes_out`" class=`"num`">Bytes Out</th><th data-sort=`"last_seen`">Last Seen</th>")
         [void]$cardsSb.AppendLine("</tr></thead><tbody>")
         [void]$cardsSb.Append($tableRows)
